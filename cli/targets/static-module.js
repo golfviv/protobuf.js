@@ -11,6 +11,12 @@ var util          = require("../util"),
 
 static_module_target.description = "Static code without reflection as a module";
 
+static_module_target.getDependency = function getDependency(options) {
+    return options.dependency || (util.isEsmWrapper(options.wrap)
+        ? "protobufjs/minimal.js"
+        : "protobufjs/minimal");
+};
+
 function static_module_target(root, options, callback) {
     require("./static")(root, options, function(err, output) {
         if (err) {
@@ -18,7 +24,9 @@ function static_module_target(root, options, callback) {
             return;
         }
         try {
-            output = util.wrap(output, protobuf.util.merge({ dependency: "protobufjs/minimal" }, options));
+            output = util.wrap(output, protobuf.util.merge({
+                dependency: static_module_target.getDependency(options)
+            }, options));
         } catch (e) {
             callback(e);
             return;

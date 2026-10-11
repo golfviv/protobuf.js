@@ -1,6 +1,9 @@
 {
     "tags": {
-        "allowUnknownTags": false
+        "allowUnknownTags": true
+    },
+    "source": {
+        "includePattern": ".+\\.(?:[cm]?js|jsdoc|jsx)$"
     },
     "plugins": [
         "./tsd-jsdoc/plugin"

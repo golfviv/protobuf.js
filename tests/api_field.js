@@ -25,6 +25,10 @@ tape.test("reflected fields", function(test) {
     }, TypeError, "should throw if rule is specified but not a rule string");
 
     test.throws(function() {
+        new protobuf.Field("a", 1, "uint32", "proto3_optional");
+    }, TypeError, "should reject parser-internal proto3_optional rule");
+
+    test.throws(function() {
         new protobuf.Field("a", 1, "uint32", "optional", 1);
     }, TypeError, "should throw if extend is specified but not a string");
 
@@ -80,6 +84,105 @@ tape.test("reflected fields", function(test) {
     field.resolved = 2;
     field.resolve();
     test.equal(field.resolved, 2, "should not resolve again if already resolved");
+
+    test.end();
+});
+
+tape.test("feature resolution legacy proto3", function(test) {
+    var json = {
+        type: "string", id: 1000, extend: "Message"
+    };
+    var messageJson = {
+        fields: {
+            a: { type: "string", id: 1}
+        },
+        extensions: [[1, 100000]],    
+    };
+    var root = new protobuf.Root();
+    var ext = protobuf.Field.fromJSON("ext", json);
+    var Message = protobuf.Type.fromJSON("Message", messageJson)
+    var field = Message.fields.a;
+    root.add(ext).add(Message).resolveAll();
+
+    test.same(ext.toJSON(), json, "JSON should roundtrip");
+    test.same(Message.toJSON(), messageJson, "container JSON should roundtrip");
+    test.same(field.toJSON(), messageJson.fields.a, "nested JSON should roundtrip");
+
+    test.equal(ext._edition, "proto3", "should set edition");
+    test.equal(ext._features.utf8_validation, "VERIFY", "should verify by default");
+    test.ok(ext.hasPresence, "should have explicit presence");
+
+    test.equal(field._edition, null, "should not set edition");
+    test.equal(ext._features.utf8_validation, "VERIFY", "should verify by default");
+    test.notOk(field.hasPresence, "should be implicit by default");
+
+    test.end();
+});
+
+tape.test("feature resolution proto2", function(test) {
+    var json = {
+        edition: "proto2",
+        type: "string", id: 1000, extend: "Message"
+    };
+    var messageJson = {
+        edition: "proto2",
+        fields: {
+            a: { type: "string", id: 1}
+        },
+        extensions: [[1, 100000]],    
+    };
+    var root = new protobuf.Root();
+    var ext = protobuf.Field.fromJSON("ext", json);
+    var Message = protobuf.Type.fromJSON("Message", messageJson)
+    var field = Message.fields.a;
+    root.add(ext).add(Message).resolveAll();
+
+    test.same(ext.toJSON(), json, "JSON should roundtrip");
+    test.same(Message.toJSON(), messageJson, "container JSON should roundtrip");
+    test.same(field.toJSON(), messageJson.fields.a, "nested JSON should roundtrip");
+
+    test.equal(ext._edition, "proto2", "should set edition");
+    test.ok(ext.hasPresence, "should have explicit presence");
+    test.equal(ext._features.utf8_validation, "NONE", "should not verify by default");
+
+    test.equal(field._edition, null, "should not set edition");
+    test.ok(field.hasPresence, "should be explicit by default");
+    test.equal(ext._features.utf8_validation, "NONE", "should not verify by default");
+
+    test.end();
+});
+
+tape.test("feature resolution editions", function(test) {
+    var json = {
+        edition: "2023",
+        options: { features: { utf8_validation: "NONE" } },
+        type: "string", id: 1000, extend: "Message"
+    };
+    var messageJson = {
+        edition: "2023",
+        options: { features: { field_presence: "IMPLICIT" } },
+        fields: {
+            a: { type: "string", id: 1}
+        },
+        extensions: [[1, 100000]],    
+    };
+    var root = new protobuf.Root();
+    var ext = protobuf.Field.fromJSON("ext", json);
+    var Message = protobuf.Type.fromJSON("Message", messageJson)
+    var field = Message.fields.a;
+    root.add(ext).add(Message).resolveAll();
+
+    test.same(ext.toJSON(), json, "JSON should roundtrip");
+    test.same(Message.toJSON(), messageJson, "container JSON should roundtrip");
+    test.same(field.toJSON(), messageJson.fields.a, "nested JSON should roundtrip");
+
+    test.equal(ext._edition, "2023", "should set edition");
+    test.ok(ext.hasPresence, "should be explicit by default");
+    test.equal(ext._features.utf8_validation, "NONE", "should get file overrides");
+
+    test.equal(field._edition, null, "should not set edition");
+    test.notOk(field.hasPresence, "should get message overrides");
+    test.equal(field._features.utf8_validation, "VERIFY", "should verify by default");
 
     test.end();
 });

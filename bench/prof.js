@@ -21,14 +21,14 @@ if (process.execArgv.indexOf("--prof") < 0) {
             fs.unlink(file);
     });
     process.stdout.write("generating profile (may take a while) ...\n");
-    child_process.execSync("node --prof --trace-deopt " + process.execArgv.join(" ") + " " + process.argv.slice(1).join(" "), {
+    child_process.execFileSync("node", ["--prof", "--trace-deopt", ...process.execArgv, ...process.argv.slice(1)], {
         cwd: process.cwd(),
         stdio: "inherit"
     });
     process.stdout.write("processing profile ...\n");
     fs.readdirSync(process.cwd()).forEach(function readdirSync_it(file) {
         if (logRe.test(file)) {
-            child_process.execSync("node --prof-process " + file, {
+            child_process.execFileSync("node", ["--prof-process", file], {
                 cwd: process.cwd(),
                 stdio: "inherit"
             });
@@ -60,10 +60,10 @@ if (process.argv[2] === "fromjson") {
 var Test, data, count;
 
 if (process.argv.indexOf("--alt") < 0) {
-    root = protobuf.parse(fs.readFileSync(require.resolve("../bench/data/bench.proto")).toString("utf8")).root;
+    root = protobuf.parse(fs.readFileSync(require.resolve("../bench/cases/common/bench.proto")).toString("utf8")).root;
     Test = root.lookup("Test");
     json = JSON.stringify(root);
-    data = require("../bench/data/bench.json");
+    data = require("../bench/cases/common/bench.json");
     count = 10000000;
     process.stdout.write("bench.proto");
 } else {
@@ -86,14 +86,14 @@ function setupBrowser() {
 switch (process.argv[2]) {
     case "encode-browser":
         setupBrowser();
-        // eslint-disable-line no-fallthrough
+        // eslint-disable-next-line no-fallthrough
     case "encode":
         for (var i = 0; i < count; ++i)
             Test.encode(data).finish();
         break;
     case "decode-browser":
         setupBrowser();
-        // eslint-disable-line no-fallthrough
+        // eslint-disable-next-line no-fallthrough
     case "decode":
         var buf = Test.encode(data).finish();
         for (var j = 0; j < count; ++j)

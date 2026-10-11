@@ -4,9 +4,11 @@ var child_process = require("child_process"),
     fs       = require("fs"),
     pkg      = require("./package.json"),
     minimist = require("minimist"),
-    chalk    = require("chalk"),
+    util     = require("./util"),
     glob     = require("glob"),
     tmp      = require("tmp");
+
+var color = util.color;
 
 /**
  * Runs pbts programmatically.
@@ -15,48 +17,82 @@ var child_process = require("child_process"),
  * @returns {number|undefined} Exit code, if known
  */
 exports.main = function(args, callback) {
+    return run({
+        args: args,
+        callback: callback
+    });
+};
+
+/**
+ * Generates TypeScript definitions from a JavaScript source.
+ * @param {string|Uint8Array} source JavaScript source
+ * @param {string[]} args Command line arguments
+ * @param {function(?Error, string=)} [callback] Optional completion callback
+ * @returns {number|undefined} Exit code, if known
+ */
+exports.process = function(source, args, callback) {
+    return run({
+        args: args,
+        callback: callback,
+        source: source
+    });
+};
+
+function run(options) {
+    var args = options.args,
+        callback = options.callback,
+        source = options.source,
+        hasSource = Object.prototype.hasOwnProperty.call(options, "source");
+
     var argv = minimist(args, {
         alias: {
             name: "n",
             out : "o",
             main: "m",
             global: "g",
-            import: "i"
+            import: "i",
+            constructors: [ "constructor" ]
         },
         string: [ "name", "out", "global", "import" ],
-        boolean: [ "comments", "main" ],
+        boolean: [ "comments", "constructors", "main" ],
         default: {
             comments: true,
+            constructors: true,
             main: false
         }
     });
 
     var files  = argv._;
 
-    if (!files.length) {
+    var invalidUsage = hasSource
+        ? files.length > 0
+        : files.length === 0;
+    if (invalidUsage) {
         if (callback)
             callback(Error("usage")); // eslint-disable-line callback-return
         else
             process.stderr.write([
                 "protobuf.js v" + pkg.version + " CLI for TypeScript",
                 "",
-                chalk.bold.white("Generates TypeScript definitions from annotated JavaScript files."),
+                color.bold + color.white + "Generates TypeScript definitions from annotated JavaScript files." + color.reset,
                 "",
                 "  -o, --out       Saves to a file instead of writing to stdout.",
                 "",
                 "  -g, --global    Name of the global object in browser environments, if any.",
                 "",
-                "  -i, --import    Comma delimited list of imports. Local names will equal camelCase of the basename.",
+                "  -i, --import    Comma delimited list of imports, optionally as localName=path.",
+                "",
+                "  --no-constructor Emits private constructors for reflection-backed declarations.",
                 "",
                 "  --no-comments   Does not output any JSDoc comments.",
                 "",
-                chalk.bold.gray("  Internal flags:"),
+                color.bold + color.gray + "  Internal flags:" + color.reset,
                 "",
                 "  -n, --name      Wraps everything in a module of the specified name.",
                 "",
-                "  -m, --main      Whether building the main library without any imports.",
+                "  -m, --main      Whether building a standalone file without any imports.",
                 "",
-                "usage: " + chalk.bold.green("pbts") + " [options] file1.js file2.js ..." + chalk.bold.gray("  (or)  ") + "other | " + chalk.bold.green("pbts") + " [options] -",
+                "usage: " + color.bold + color.green + "pbts" + color.reset + " [options] file1.js file2.js ..." + color.bold + color.gray + "  (or)  " + color.reset + "other | " + color.bold + color.green + "pbts" + color.reset + " [options] -",
                 ""
             ].join("\n"));
         return 1;
@@ -74,8 +110,15 @@ exports.main = function(args, callback) {
 
     var cleanup = [];
 
+    // Load provided source through a temporary file because JSDoc expects file paths.
+    if (hasSource) {
+        files[0] = tmp.tmpNameSync() + ".js";
+        fs.writeFileSync(files[0], source, typeof source === "string" ? { encoding: "utf8" } : undefined);
+        cleanup.push(files[0]);
+        callJsdoc();
+
     // Read from stdin (to a temporary file)
-    if (files.length === 1 && files[0] === "-") {
+    } else if (files.length === 1 && files[0] === "-") {
         var data = [];
         process.stdin.on("data", function(chunk) {
             data.push(chunk);
@@ -97,13 +140,23 @@ exports.main = function(args, callback) {
         // There is no proper API for jsdoc, so this executes the CLI and pipes the output
         var basedir = path.join(__dirname, ".");
         var moduleName = argv.name || "null";
-        var nodePath = process.execPath;
-        var cmd = "\"" + nodePath + "\" \"" + require.resolve("jsdoc/jsdoc.js") + "\" -c \"" + path.join(basedir, "lib", "tsd-jsdoc.json") + "\" -q \"module=" + encodeURIComponent(moduleName) + "&comments=" + Boolean(argv.comments) + "\" " + files.map(function(file) { return "\"" + file + "\""; }).join(" ");
-        var child = child_process.exec(cmd, {
+        // JSDoc 4 uses requizzle, which depends on Node's CommonJS loader internals.
+        var nodePath = typeof Bun === "undefined"
+            ? process.execPath
+            : process.env.npm_node_execpath || "node"; // eslint-disable-line no-process-env
+        var jsdocArgs = [
+            require.resolve("jsdoc/jsdoc.js"),
+            "-c",
+            path.join(basedir, "lib", "tsd-jsdoc.json"),
+            "-q",
+            "module=" + encodeURIComponent(moduleName)
+                + "&comments=" + Boolean(argv.comments)
+                + "&constructor=" + Boolean(argv.constructors)
+        ].concat(files);
+        var child = child_process.spawn(nodePath, jsdocArgs, {
             cwd: process.cwd(),
             argv0: "node",
-            stdio: "pipe",
-            maxBuffer: 1 << 24 // 16mb
+            stdio: "pipe"
         });
         var out = [];
         var ended = false;
@@ -140,11 +193,25 @@ exports.main = function(args, callback) {
             });
         }
 
+        function addImport(imports, importItem) {
+            var equals = importItem.indexOf("=");
+            if (equals < 0) {
+                imports[getImportName(importItem)] = importItem;
+                return;
+            }
+
+            var importName = importItem.substring(0, equals),
+                importPath = importItem.substring(equals + 1);
+            if (importName[0] === "\\" && importName[1] === "$")
+                importName = importName.substring(1);
+            imports[importName] = importPath;
+        }
+
         function finish() {
             var output = [];
             if (argv.main)
                 output.push(
-                    "// DO NOT EDIT! This is a generated file. Edit the JSDoc in src/*.js instead and run 'npm run types'.",
+                    "// DO NOT EDIT! This is a generated file. Edit the source file instead and regenerate.",
                     ""
                 );
             if (argv.global)
@@ -153,25 +220,34 @@ exports.main = function(args, callback) {
                     ""
                 );
 
-            if (!argv.main) {
+            if (!argv.main || argv.import) {
                 // Ensure we have a usable array of imports
-                var importArray = typeof argv.import === "string" ? argv.import.split(",") : argv.import || [];
+                var importArray = [];
+                [].concat(argv.import || []).forEach(function(importItem) {
+                    importArray = importArray.concat(importItem.split(","));
+                });
 
                 // Build an object of imports and paths
-                var imports = {
+                var imports = argv.main ? {} : {
                     $protobuf: "protobufjs"
                 };
                 importArray.forEach(function(importItem) {
-                    imports[getImportName(importItem)] = importItem;
+                    addImport(imports, importItem);
                 });
 
                 // Write out the imports
                 Object.keys(imports).forEach(function(key) {
                     output.push("import * as " + key + " from \"" + imports[key] + "\";");
                 });
+
+                if (!argv.main)
+                    output.push("import Long = require(\"long\");");
+                output.push("");
             }
 
-            output = output.join("\n") + "\n" + out.join("");
+            output = output.length
+                ? output.join("\n") + "\n" + out.join("")
+                : out.join("");
 
             try {
                 if (argv.out)
@@ -190,4 +266,4 @@ exports.main = function(args, callback) {
     }
 
     return undefined;
-};
+}

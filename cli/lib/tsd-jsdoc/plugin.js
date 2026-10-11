@@ -1,5 +1,9 @@
 "use strict";
+
+var patch = require("./patch");
+
 exports.defineTags = function(dictionary) {
+    patch.defineTags(dictionary);
 
     dictionary.defineTag("template", {
         mustHaveValue: true,
@@ -15,7 +19,7 @@ exports.defineTags = function(dictionary) {
         canHaveType: false,
         canHaveName: false,
         onTagged: function(doclet, tag) {
-            doclet.tsType = tag.text;
+            doclet.tsType = patch.normalizeType(tag.text);
         }
     });
 };

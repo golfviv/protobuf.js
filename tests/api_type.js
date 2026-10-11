@@ -44,12 +44,27 @@ tape.test("reflected types", function(test) {
     type.ctor = MyMessageAuto;
     test.ok(MyMessageAuto.prototype instanceof protobuf.Message, "should properly register a constructor through assignment");
     test.ok(typeof MyMessageAuto.encode === "function", "should populate static methods on assigned constructors");
+    test.equal(new MyMessageAuto().a, 0, "should initialize prototype defaults on assigned constructors");
 
     function MyMessageManual() {}
     MyMessageManual.prototype = Object.create(protobuf.Message.prototype);
     type.ctor = MyMessageManual;
     test.ok(MyMessageManual.prototype instanceof protobuf.Message, "should properly register a constructor through assignment if already extending message");
     test.ok(typeof MyMessageManual.encode === "function", "should populate static methods on assigned constructors");
+    test.equal(new MyMessageManual().a, 0, "should initialize prototype defaults on assigned constructors if already extending message");
+
+    function MyDecodeMessage() {}
+    type = protobuf.Type.fromJSON("DecodeTest", {
+        fields: {
+            a: { type: "uint32", id: 1 }
+        }
+    });
+    var buf = protobuf.Writer.create().uint32(8).uint32(42).finish();
+    test.notOk(type.decode(buf) instanceof MyDecodeMessage, "should decode with the generated constructor before assignment");
+    test.notOk(type.fromObject({ a: 42 }) instanceof MyDecodeMessage, "should convert with the generated constructor before assignment");
+    type.ctor = MyDecodeMessage;
+    test.ok(type.decode(buf) instanceof MyDecodeMessage, "should decode with assigned constructor after setup");
+    test.ok(type.fromObject({ a: 42 }) instanceof MyDecodeMessage, "should convert with assigned constructor after setup");
 
     type = protobuf.Type.fromJSON("My", {
         fields: {
@@ -94,9 +109,725 @@ tape.test("reflected types", function(test) {
     }, Error, "should throw when trying to add reserved ids");
 
     test.throws(function() {
+        type.add(new protobuf.Field("c", 999, "uint32"));
+    }, Error, "should throw when trying to add reserved range end ids");
+
+    test.throws(function() {
         type.add(new protobuf.Field("b", 2, "uint32"));
     }, Error, "should throw when trying to add reserved names");
 
+    var renameType = new protobuf.Type("Rename");
+    var field = new protobuf.Field("before", 1, "string");
+    var oneof = new protobuf.OneOf("choice");
+    renameType.add(field);
+    renameType.add(oneof);
+    field.name = "after";
+    oneof.name = "selection";
+    renameType.remove(field);
+    renameType.remove(oneof);
+    test.equal(field.parent, null, "should remove renamed fields");
+    test.equal(oneof.parent, null, "should remove renamed oneofs");
+    test.same(renameType.fields, {}, "should remove renamed fields from the original key");
+    test.same(renameType.oneofs, {}, "should remove renamed oneofs from the original key");
+
+    test.end();
+});
+
+tape.test("generated message constructors", function(test) {
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Message: {
+                fields: {
+                    value: { type: "uint32", id: 1 }
+                }
+            }
+        }
+    });
+    var Message = root.lookupType("Message");
+    var msg = new Message.ctor(JSON.parse("{\"__proto__\":{\"marker\":true},\"value\":1}"));
+
+    test.equal(msg.value, 1, "should copy regular properties");
+    test.equal(msg.marker, undefined, "should ignore reserved properties");
+
+    var type = new protobuf.Type("Type");
+    type.add(new protobuf.Field("__proto__", 2, "uint32"));
+    test.equal(type.get("__proto__"), null, "should ignore reserved field names");
+    type.add(new protobuf.OneOf("__proto__"));
+    test.equal(type.get("__proto__"), null, "should ignore reserved oneof names");
+
+    ["1Message", "default"].forEach(function(name) {
+        var root = protobuf.Root.fromJSON({
+            nested: {
+                [name]: {
+                    fields: {
+                        value: { type: "uint32", id: 1 }
+                    }
+                }
+            }
+        });
+        var Type = root.lookupType(name);
+        test.equal(Type.create({ value: 1 }).value, 1, "should create messages with generated-safe type names");
+    });
+
+    var ObjectMessage = protobuf.parse("syntax = \"proto3\"; message Object { string value = 1; }").root.lookupType("Object");
+    test.equal(ObjectMessage.create({ value: "x" }).value, "x", "should create messages with runtime-significant type names");
+
+    test.throws(function() {
+        protobuf.Root.fromJSON({
+            nested: {
+                TypeShadow: {
+                    fields: {
+                        $type: { type: "string", id: 1 }
+                    }
+                }
+            }
+        });
+    }, /name '\$type' is reserved/, "should reject runtime-reserved field names");
+
+    test.throws(function() {
+        protobuf.Root.fromJSON({
+            nested: {
+                TypeShadow: {
+                    oneofs: {
+                        $type: { oneof: [] }
+                    },
+                    fields: {}
+                }
+            }
+        });
+    }, /name '\$type' is reserved/, "should reject runtime-reserved oneof names");
+
+    var ConstructorShadow = protobuf.parse("syntax = \"proto3\"; message ConstructorShadow { string constructor = 1; }").root.lookupType("ConstructorShadow");
+    test.equal(JSON.stringify(ConstructorShadow.decode(ConstructorShadow.encode({ constructor: "x" }).finish())), "{\"constructor\":\"x\"}", "should stringify messages with an own constructor field");
+
+    test.end();
+});
+
+tape.test("decode nesting", function(test) {
+    function varint(value) {
+        var bytes = [];
+        do {
+            var b = value & 0x7F;
+            value >>>= 7;
+            if (value)
+                b |= 0x80;
+            bytes.push(b);
+        } while (value);
+        return bytes;
+    }
+
+    function nestedPayload(depth) {
+        var payload = [ 0x10, 0x2A ];
+        for (var i = 0; i < depth; ++i)
+            payload = [ 0x0A ].concat(varint(payload.length), payload);
+        return protobuf.util.newBuffer(payload);
+    }
+
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Node: {
+                fields: {
+                    child: { type: "Node", id: 1 },
+                    value: { type: "int32", id: 2 }
+                }
+            }
+        }
+    });
+    var Node = root.lookupType("Node");
+    var recursionLimit = protobuf.Reader.recursionLimit;
+
+    protobuf.Reader.recursionLimit = 3;
+    try {
+        test.equal(Node.decode(nestedPayload(2)).child.child.value, 42, "should decode below the limit");
+        test.throws(function() {
+            Node.decode(nestedPayload(4));
+        }, /max depth exceeded/, "should reject excessive nesting");
+    } finally {
+        protobuf.Reader.recursionLimit = recursionLimit;
+    }
+
+    test.end();
+});
+
+tape.test("encode nesting", function(test) {
+    function nestedObject(depth, field) {
+        var object = { value: 42 };
+        for (var i = 0; i < depth; ++i) {
+            if (field === "child")
+                object = { child: object };
+            else if (field === "children")
+                object = { children: [ object ] };
+            else
+                object = { childMap: { child: object } };
+        }
+        return object;
+    }
+
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Node: {
+                fields: {
+                    child: { type: "Node", id: 1 },
+                    children: { rule: "repeated", type: "Node", id: 2 },
+                    childMap: { keyType: "string", type: "Node", id: 3 },
+                    value: { type: "int32", id: 4 }
+                }
+            }
+        }
+    });
+    var Node = root.lookupType("Node");
+    var recursionLimit = protobuf.util.recursionLimit;
+
+    protobuf.util.recursionLimit = 3;
+    try {
+        test.ok(Node.encode(nestedObject(2, "child")).finish().length, "should encode singular messages below the limit");
+        test.throws(function() {
+            Node.encode(nestedObject(4, "child")).finish();
+        }, /max depth exceeded/, "should reject excessive singular message nesting");
+
+        test.ok(Node.encode(nestedObject(2, "children")).finish().length, "should encode repeated messages below the limit");
+        test.throws(function() {
+            Node.encode(nestedObject(4, "children")).finish();
+        }, /max depth exceeded/, "should reject excessive repeated message nesting");
+
+        test.ok(Node.encode(nestedObject(2, "childMap")).finish().length, "should encode map message values below the limit");
+        test.throws(function() {
+            Node.encode(nestedObject(4, "childMap")).finish();
+        }, /max depth exceeded/, "should reject excessive map message value nesting");
+    } finally {
+        protobuf.util.recursionLimit = recursionLimit;
+    }
+
+    test.end();
+});
+
+tape.test("encode setup preserves nesting", function(test) {
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Parent: {
+                fields: {
+                    child: { type: "Child", id: 1 }
+                }
+            },
+            Child: {
+                fields: {
+                    next: { type: "Child", id: 1 },
+                    value: { type: "int32", id: 2 }
+                }
+            }
+        }
+    });
+    var Parent = root.lookupType("Parent");
+    var recursionLimit = protobuf.util.recursionLimit;
+
+    protobuf.util.recursionLimit = 1;
+    try {
+        test.throws(function() {
+            Parent.encode({ child: { next: { value: 42 } } }).finish();
+        }, /max depth exceeded/, "should preserve depth through nested type setup");
+    } finally {
+        protobuf.util.recursionLimit = recursionLimit;
+    }
+
+    test.end();
+});
+
+tape.test("decode known fields by wire type", function(test) {
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Message: {
+                fields: {
+                    value: { type: "int32", id: 1 }
+                }
+            }
+        }
+    });
+    var Message = root.lookupType("Message");
+    var field0Varint = [ 0, 0 ];
+    var field1WireType6 = [ 1 << 3 | 6, 0 ];
+    var field1WireType7 = [ 1 << 3 | 7, 0 ];
+    var field1Fixed64 = [ 1 << 3 | 1, 1, 2, 3, 4, 5, 6, 7, 8 ];
+    var field1Group = [ 1 << 3 | 3, 1 << 3 | 4 ];
+    var field1GroupField2End = [ 1 << 3 | 3, 2 << 3 | 4 ];
+    var field1TagWithContinuation = 1 << 3 | 128;
+    var fieldNumberTooHigh = [ field1TagWithContinuation, 128, 128, 128, 128, 15, 210, 9 ];
+    var fieldNumberSlightlyTooHigh = [ field1TagWithContinuation, 128, 128, 128, 64, 210, 9 ];
+    var overlongTagVarint = [ field1TagWithContinuation, 128, 128, 128, 128, 128, 128, 128, 0, 210, 9 ];
+    var tagVarintMoreThanTenBytes = [ field1TagWithContinuation, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0, 210, 9 ];
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(field0Varint));
+    }, /illegal tag: field number 0/, "should reject field number 0");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(field1WireType6));
+    }, /invalid wire type 6/, "should reject invalid wire types for known fields");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(field1WireType7));
+    }, /invalid wire type 7/, "should reject invalid wire types for known fields");
+
+    var message = Message.decode(protobuf.util.newBuffer(field1Fixed64));
+    test.notOk(Object.prototype.hasOwnProperty.call(message, "value"), "should skip valid but unexpected wire types");
+
+    message = Message.decode(protobuf.util.newBuffer(field1Group));
+    test.notOk(Object.prototype.hasOwnProperty.call(message, "value"), "should skip valid but unexpected groups");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(field1GroupField2End));
+    }, /invalid end group tag/, "should reject mismatched unknown group tags");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(fieldNumberTooHigh));
+    }, /invalid tag encoding/, "should reject tags above the maximum field number");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(fieldNumberSlightlyTooHigh));
+    }, /invalid tag encoding/, "should reject tags above uint32 range");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(overlongTagVarint));
+    }, /invalid tag encoding/, "should reject overlong tag varints");
+
+    test.throws(function() {
+        Message.decode(protobuf.util.newBuffer(tagVarintMoreThanTenBytes));
+    }, /invalid tag encoding/, "should reject tag varints longer than ten bytes");
+    test.end();
+});
+
+tape.test("decode string fields by utf8_validation feature", function(test) {
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Verify: {
+                fields: {
+                    singular: { type: "string", id: 1 },
+                    repeated: { rule: "repeated", type: "string", id: 2 },
+                    map: { keyType: "string", type: "string", id: 3 },
+                    choice: { type: "string", id: 4 }
+                },
+                oneofs: {
+                    kind: { oneof: [ "choice" ] }
+                }
+            },
+            Proto2: {
+                edition: "proto2",
+                fields: {
+                    value: { type: "string", id: 1 }
+                }
+            },
+            EditionNone: {
+                edition: "2023",
+                options: { features: { utf8_validation: "NONE" } },
+                fields: {
+                    value: { type: "string", id: 1 }
+                }
+            }
+        }
+    });
+    var Verify = root.lookupType("Verify");
+    var Proto2 = root.lookupType("Proto2");
+    var EditionNone = root.lookupType("EditionNone");
+    var invalid = [ 0xA0, 0xB0, 0xC0, 0xD0 ];
+    var surrogate = [ 0xED, 0xA0, 0x80 ];
+    var valid = [ 0x66, 0x6F, 0x6F ];
+    var invalidReplacement = protobuf.util.newBuffer(invalid).toString("utf8");
+    var surrogateReplacement = protobuf.util.newBuffer(surrogate).toString("utf8");
+
+    function stringField(id, value) {
+        return [ id << 3 | 2, value.length ].concat(value);
+    }
+
+    function mapField(key, value) {
+        var entry = stringField(1, key).concat(stringField(2, value));
+        return [ 3 << 3 | 2, entry.length ].concat(entry);
+    }
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(stringField(1, invalid)));
+    }, /utf-?8|encoded data/i, "should reject invalid singular strings when verification is enabled");
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(stringField(2, invalid)));
+    }, /utf-?8|encoded data/i, "should reject invalid repeated strings when verification is enabled");
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(stringField(4, invalid)));
+    }, /utf-?8|encoded data/i, "should reject invalid oneof strings when verification is enabled");
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(mapField(invalid, valid)));
+    }, /utf-?8|encoded data/i, "should reject invalid map string keys when verification is enabled");
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(mapField(valid, invalid)));
+    }, /utf-?8|encoded data/i, "should reject invalid map string values when verification is enabled");
+
+    test.throws(function() {
+        Verify.decode(protobuf.util.newBuffer(stringField(1, surrogate)));
+    }, /utf-?8|encoded data/i, "should reject UTF8-encoded lone surrogates when verification is enabled");
+
+    test.equal(
+        Verify.decode(stringField(1, [ 0xC3, 0xBC ])).singular,
+        "\u00fc",
+        "should decode valid non-ASCII strings from array buffers when verification is enabled"
+    );
+
+    test.equal(
+        Proto2.decode(protobuf.util.newBuffer(stringField(1, invalid))).value,
+        invalidReplacement,
+        "should replace malformed strings when verification is disabled by proto2 defaults"
+    );
+
+    test.equal(
+        EditionNone.decode(protobuf.util.newBuffer(stringField(1, invalid))).value,
+        invalidReplacement,
+        "should replace malformed strings when verification is disabled by editions features"
+    );
+
+    test.equal(
+        Proto2.decode(protobuf.util.newBuffer(stringField(1, surrogate))).value,
+        surrogateReplacement,
+        "should replace UTF8-encoded lone surrogates when verification is disabled by proto2 defaults"
+    );
+
+    test.equal(
+        EditionNone.decode(protobuf.util.newBuffer(stringField(1, surrogate))).value,
+        surrogateReplacement,
+        "should replace UTF8-encoded lone surrogates when verification is disabled by editions features"
+    );
+
+    test.end();
+});
+
+// TODO: Protoc rejects open enums whose first value is not zero.
+// We should do the same, but for v8 this would be a regression.
+// Remove this test once we enforce this restriction.
+tape.test("decode implicit enum zero with non-zero default", function(test) {
+    var Message = protobuf.Root.fromJSON({
+        nested: {
+            Op: { values: { UNKNOWN: -1, INSERT: 0 } },
+            Message: {
+                fields: {
+                    op: { type: "Op", id: 4 }
+                }
+            }
+        }
+    }).lookupType("Message");
+
+    test.notOk(Message.fields.op.hasPresence, "enum field should have implicit presence");
+    test.equal(Message.fields.op.typeDefault, -1, "enum field should use the first value as default");
+    test.equal(Message.decode(protobuf.util.newBuffer([0x20, 0x00])).op, 0, "should preserve explicit enum zero");
+    test.equal(Buffer.from(Message.encode({ op: -1 }).finish()).toString("hex"), "", "should omit implicit enum default");
+    test.equal(Buffer.from(Message.encode({ op: 0 }).finish()).toString("hex"), "2000", "should encode non-default enum zero");
+
+    test.end();
+});
+
+tape.test("encode omits implicit default values", function(test) {
+    var Message = protobuf.parse("syntax=\"proto3\";\
+        message Message {\
+            int32 int32_value = 1;\
+            bool bool_value = 2;\
+            string string_value = 3;\
+            bytes bytes_value = 4;\
+            double double_value = 5;\
+            float float_value = 6;\
+            Enum enum_value = 7;\
+            optional int32 optional_int32_value = 8;\
+            optional double optional_double_value = 9;\
+            oneof kind { int32 oneof_int32_value = 10; }\
+            enum Enum { A = 0; B = 1; }\
+        }").root.resolveAll().lookupType("Message");
+
+    function hex(buf) {
+        return Buffer.from(buf).toString("hex");
+    }
+
+    test.equal(hex(Message.encode({
+        int32Value: 0,
+        boolValue: false,
+        stringValue: "",
+        bytesValue: [],
+        doubleValue: 0,
+        floatValue: 0,
+        enumValue: 0
+    }).finish()), "", "should omit implicit scalar defaults");
+
+    test.equal(hex(Message.encode({
+        doubleValue: -0,
+        floatValue: -0
+    }).finish()), "2900000000000000803500000080", "should preserve implicit negative zero");
+
+    test.equal(hex(Message.encode({
+        optionalInt32Value: 0,
+        optionalDoubleValue: -0,
+        oneofInt32Value: 0
+    }).finish()), "40004900000000000000805000", "should encode explicit defaults");
+
+    test.end();
+});
+
+tape.test("decode preserves implicit negative zero", function(test) {
+    var Message = protobuf.parse("syntax=\"proto3\";\
+        message Message {\
+            double double_value = 1;\
+            float float_value = 2;\
+            optional double optional_double_value = 3;\
+            optional float optional_float_value = 4;\
+        }").root.resolveAll().lookupType("Message");
+
+    function bytes(hex) {
+        return protobuf.util.newBuffer(Buffer.from(hex, "hex"));
+    }
+
+    function hex(buf) {
+        return Buffer.from(buf).toString("hex");
+    }
+
+    var implicit = Message.decode(bytes("0900000000000000801500000080"));
+    test.ok(Object.is(implicit.doubleValue, -0), "should decode implicit double negative zero");
+    test.ok(Object.is(implicit.floatValue, -0), "should decode implicit float negative zero");
+    test.equal(hex(Message.encode(implicit).finish()), "0900000000000000801500000080", "should re-encode implicit negative zero");
+
+    var positive = Message.decode(bytes("0900000000000000001500000000"));
+    test.notOk(Object.prototype.hasOwnProperty.call(positive, "doubleValue"), "should drop implicit double positive zero");
+    test.notOk(Object.prototype.hasOwnProperty.call(positive, "floatValue"), "should drop implicit float positive zero");
+    test.equal(hex(Message.encode(positive).finish()), "", "should not re-encode implicit positive zero");
+
+    var explicit = Message.decode(bytes("1900000000000000802500000080"));
+    test.ok(Object.is(explicit.optionalDoubleValue, -0), "should decode explicit double negative zero");
+    test.ok(Object.is(explicit.optionalFloatValue, -0), "should decode explicit float negative zero");
+    test.equal(hex(Message.encode(explicit).finish()), "1900000000000000802500000080", "should re-encode explicit negative zero");
+
+    test.end();
+});
+
+tape.test("fromObject preserves implicit negative zero", function(test) {
+    var Message = protobuf.parse("syntax=\"proto3\";\
+        message Message {\
+            double double_value = 1;\
+            float float_value = 2;\
+            optional double optional_double_value = 3;\
+            optional float optional_float_value = 4;\
+        }").root.resolveAll().lookupType("Message");
+
+    function hex(buf) {
+        return Buffer.from(buf).toString("hex");
+    }
+
+    var implicit = Message.fromObject({
+        doubleValue: -0,
+        floatValue: -0
+    });
+    test.ok(Object.is(implicit.doubleValue, -0), "should convert implicit double negative zero");
+    test.ok(Object.is(implicit.floatValue, -0), "should convert implicit float negative zero");
+    test.equal(hex(Message.encode(implicit).finish()), "0900000000000000801500000080", "should encode converted implicit negative zero");
+
+    var positive = Message.fromObject({
+        doubleValue: 0,
+        floatValue: 0
+    });
+    test.notOk(Object.prototype.hasOwnProperty.call(positive, "doubleValue"), "should drop implicit double positive zero");
+    test.notOk(Object.prototype.hasOwnProperty.call(positive, "floatValue"), "should drop implicit float positive zero");
+    test.equal(hex(Message.encode(positive).finish()), "", "should not encode converted implicit positive zero");
+
+    var explicit = Message.fromObject({
+        optionalDoubleValue: -0,
+        optionalFloatValue: -0
+    });
+    test.ok(Object.is(explicit.optionalDoubleValue, -0), "should convert explicit double negative zero");
+    test.ok(Object.is(explicit.optionalFloatValue, -0), "should convert explicit float negative zero");
+    test.equal(hex(Message.encode(explicit).finish()), "1900000000000000802500000080", "should encode converted explicit negative zero");
+
+    test.end();
+});
+
+tape.test("object conversion nesting", function(test) {
+    function nestedObject(depth) {
+        var object = { value: 42 };
+        for (var i = 0; i < depth; ++i)
+            object = { child: object };
+        return object;
+    }
+
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Node: {
+                fields: {
+                    child: { type: "Node", id: 1 },
+                    value: { type: "int32", id: 2 }
+                }
+            }
+        }
+    });
+    var Node = root.lookupType("Node");
+    var recursionLimit = protobuf.util.recursionLimit;
+
+    protobuf.util.recursionLimit = 3;
+    try {
+        test.equal(Node.verify(nestedObject(2)), null, "should verify below the limit");
+        test.match(Node.verify(nestedObject(4)), /max depth exceeded/, "should reject excessive nesting while verifying");
+        test.equal(Node.fromObject(nestedObject(2)).child.child.value, 42, "should convert below the limit");
+        test.throws(function() {
+            Node.fromObject(nestedObject(4));
+        }, /max depth exceeded/, "should reject excessive nesting while converting");
+    } finally {
+        protobuf.util.recursionLimit = recursionLimit;
+    }
+
+    test.end();
+});
+
+tape.test("object conversion rejects null message values", function(test) {
+    var root = protobuf.Root.fromJSON({
+        nested: {
+            Document: {
+                fields: {
+                    attrs: { keyType: "string", type: "Metadata", id: 1 },
+                    tags: { rule: "repeated", type: "Metadata", id: 2 },
+                    meta: { type: "Metadata", id: 3 }
+                }
+            },
+            Metadata: {
+                fields: {
+                    key: { type: "string", id: 1 },
+                    value: { type: "string", id: 2 }
+                }
+            }
+        }
+    });
+    var Document = root.lookupType("Document");
+    var Metadata = root.lookupType("Metadata");
+
+    test.throws(function() {
+        Metadata.fromObject(null);
+    }, /object expected/, "should reject null top-level messages");
+
+    test.throws(function() {
+        Document.fromObject({ attrs: { bad: null } });
+    }, /object expected/, "should reject null map message values");
+
+    test.throws(function() {
+        Document.fromObject({ tags: [ null ] });
+    }, /object expected/, "should reject null repeated message values");
+
+    test.equal(Object.prototype.hasOwnProperty.call(Document.fromObject({ meta: null }), "meta"), false, "should ignore null singular message fields");
+
+    test.end();
+});
+
+tape.test("feature resolution legacy proto3", function(test) {
+    var json = {
+        fields: {
+            regular: { type: "string", id: 1 },
+            packed: { type: "int32", id: 2, rule: "repeated" },
+            unpacked: { type: "int32", id: 3, rule: "repeated", options: { packed: false } }
+        },
+        nested: { Nested: { fields: {
+            regular: { type: "string", id: 1 },
+            packed: { type: "int32", id: 2, rule: "repeated" },
+            unpacked: { type: "int32", id: 3, rule: "repeated", options: { packed: false } }
+        } } }
+    };
+    var root = new protobuf.Root();
+    var Type = protobuf.Type.fromJSON("My", json);
+    root.add(Type).resolveAll();
+
+    var Nested = Type.nested.Nested;
+
+    test.same(Type.toJSON(), json, "JSON should roundtrip");
+    test.same(Nested.toJSON(), json.nested.Nested, "nested JSON should roundtrip");
+
+    test.equal(Type._edition, "proto3", "should infer proto3 syntax");
+    test.notOk(Type.fields.regular.hasPresence, "should have implicit presence by default");
+    test.ok(Type.fields.packed.packed, "should have packed encoding by default");
+    test.notOk(Type.fields.unpacked.packed, "should override expanded encoding");
+
+    test.equal(Nested._edition, null, "should not infer proto3 syntax");
+    test.notOk(Nested.fields.regular.hasPresence, "nested should have implicit presence by default");
+    test.ok(Nested.fields.packed.packed, "nested should have packed encoding by default");
+    test.notOk(Nested.fields.unpacked.packed, "nested should override expanded encoding");
+
+    test.end();
+});
+
+tape.test("feature resolution proto2", function(test) {
+    var json = {
+        edition: "proto2",
+        fields: {
+            regular: { type: "string", id: 1 },
+            required: { type: "string", id: 2, rule: "required" },
+            packed: { type: "int32", id: 3, rule: "repeated", options: { packed: true } },
+            unpacked: { type: "int32", id: 4, rule: "repeated"}
+        },
+        nested: { Nested: { fields: {
+            regular: { type: "string", id: 1 },
+            packed: { type: "int32", id: 2, rule: "repeated", options: { packed: true } },
+            unpacked: { type: "int32", id: 3, rule: "repeated" }
+        } } }
+    };
+    var root = new protobuf.Root();
+    var Type = protobuf.Type.fromJSON("My", json);
+    root.add(Type).resolveAll();
+
+    var Nested = Type.nested.Nested;
+
+    test.same(Type.toJSON(), json, "JSON should roundtrip");
+    test.same(Nested.toJSON(), json.nested.Nested, "nested JSON should roundtrip");
+
+    test.equal(Type._edition, "proto2", "should set edition");
+    test.ok(Type.fields.regular.hasPresence, "should have explicit presence by default");
+    test.ok(Type.fields.required.required, "should have required fields");
+    test.ok(Type.fields.packed.packed, "should override packed encoding");
+    test.notOk(Type.fields.unpacked.packed, "should have expanded encoding by default");
+
+    test.equal(Nested._edition, null, "should not set edition");
+    test.ok(Nested.fields.regular.hasPresence, "nested should have explicit presence by default");
+    test.notOk(Nested.fields.unpacked.packed, "nested should have expanded encoding by default");
+    test.ok(Nested.fields.packed.packed, "nested should override packed encoding");
+
+    test.end();
+});
+
+
+tape.test("feature resolution edition 2023", function(test) {
+    var json = {
+        edition: "2023",
+        fields: {
+            explicit: { type: "string", id: 1 },
+            implicit: { type: "string", id: 2, options: { "features": { "field_presence": "IMPLICIT" } } },
+            required: { type: "string", id: 3, rule: "required", options: { "features": { "field_presence": "LEGACY_REQUIRED" } } },
+            packed: { type: "int32", id: 4, rule: "repeated" },
+            unpacked: { type: "int32", id: 5, rule: "repeated", options: { "features": { "repeated_field_encoding": "EXPANDED" } } }
+        },
+        nested: { Nested: { fields: {
+            explicit: { type: "string", id: 1 },
+            implicit: { type: "string", id: 2, options: { "features": { "field_presence": "IMPLICIT" } } },
+            packed: { type: "int32", id: 3, rule: "repeated" },
+            unpacked: { type: "int32", id: 4, rule: "repeated", options: { "features": { "repeated_field_encoding": "EXPANDED" } } }
+        } } }
+    };
+    var root = new protobuf.Root();
+    var Type = protobuf.Type.fromJSON("My", json);
+    root.add(Type).resolveAll();
+
+    var Nested = Type.nested.Nested;
+
+    test.same(Type.toJSON(), json, "JSON should roundtrip");
+    test.same(Nested.toJSON(), json.nested.Nested, "nested JSON should roundtrip");
+
+    test.equal(Type._edition, "2023", "should set edition");
+    test.ok(Type.fields.explicit.hasPresence, "should have explicit presence");
+    test.notOk(Type.fields.implicit.hasPresence, "should have implicit presence");
+    test.ok(Type.fields.required.required, "should have required presence");
+    test.ok(Type.fields.packed.packed, "should have packed encoding");
+    test.notOk(Type.fields.unpacked.packed, "should have expanded encoding");
+
+    test.equal(Nested._edition, null, "should not set edition");
+    test.ok(Nested.fields.explicit.hasPresence, "nested should have explicit presence");
+    test.notOk(Nested.fields.implicit.hasPresence, "nested should have implicit presence");
+    test.ok(Nested.fields.packed.packed, "nested should have packed encoding");
+    test.notOk(Nested.fields.unpacked.packed, "nested should have expanded encoding");
 
     test.end();
 });

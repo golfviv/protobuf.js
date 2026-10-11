@@ -1,8 +1,7 @@
 "use strict";
 module.exports = static_target;
 
-var UglifyJS   = require("uglify-js"),
-    espree     = require("espree"),
+var espree     = require("espree"),
     escodegen  = require("escodegen"),
     estraverse = require("estraverse"),
     protobuf   = require("protobufjs");
@@ -16,6 +15,8 @@ var Type      = protobuf.Type,
 var out = [];
 var indent = 0;
 var config = {};
+var globalRefs = new Set();
+var globalAliasIndex = -1;
 
 static_target.description = "Static code without reflection (non-functional on its own)";
 
@@ -32,18 +33,26 @@ function static_target(root, options, callback) {
             if (config.comments)
                 push("// Common aliases");
             push((config.es6 ? "const " : "var ") + aliases.map(function(name) { return "$" + name + " = $protobuf." + name; }).join(", ") + ";");
+            globalAliasIndex = out.length;
             push("");
         }
         if (config.comments) {
             if (root.comment) {
-                pushComment("@fileoverview " + root.comment);
+                pushComment([ "@fileoverview " + root.comment ]);
                 push("");
             }
             push("// Exported root namespace");
         }
-        var rootProp = util.safeProp(config.root || "default");
+        var rootProp = "[" + JSON.stringify(String(config.root || "default")) + "]";
         push((config.es6 ? "const" : "var") + " $root = $protobuf.roots" + rootProp + " || ($protobuf.roots" + rootProp + " = {});");
         buildNamespace(null, root);
+        var globalAliases = Array.from(globalRefs);
+        if (globalAliases.length) {
+            var aliasDecl = (config.es6 ? "const " : "var ") + globalAliases.map(function(name) {
+                return "$" + name + " = $util.global." + name;
+            }).join(", ") + ";";
+            out.splice(globalAliasIndex, 0, aliasDecl);
+        }
         return callback(null, out.join("\n"));
     } catch (err) {
         return callback(err);
@@ -51,6 +60,8 @@ function static_target(root, options, callback) {
         out = [];
         indent = 0;
         config = {};
+        globalRefs = new Set();
+        globalAliasIndex = -1;
     }
 }
 
@@ -79,29 +90,40 @@ function pushComment(lines) {
     push(" */");
 }
 
+function objectPath(object) {
+    var parts = [];
+    while (object && object.name !== "") {
+        parts.unshift(escapeName(object.name));
+        object = object.parent;
+    }
+    return parts;
+}
+
 function exportName(object, asInterface) {
     if (asInterface) {
         if (object.__interfaceName)
             return object.__interfaceName;
     } else if (object.__exportName)
         return object.__exportName;
-    var parts = object.fullName.substring(1).split("."),
-        i = 0;
-    while (i < parts.length)
-        parts[i] = escapeName(parts[i++]);
-    if (asInterface)
-        parts[i - 1] = "I" + parts[i - 1];
+    var parts = objectPath(object);
+    if (asInterface && parts.length)
+        parts[parts.length - 1] = "I" + parts[parts.length - 1];
     return object[asInterface ? "__interfaceName" : "__exportName"] = parts.join(".");
 }
 
 function escapeName(name) {
     if (!name)
         return "$root";
-    return util.isReserved(name) ? name + "_" : name;
+    name = name.replace(/\W/g, "");
+    if (!name)
+        return "_";
+    if (/^\d/.test(name))
+        name = "_" + name;
+    return util.patterns.reservedRe.test(name) ? name + "_" : name;
 }
 
 function aOrAn(name) {
-    return ((/^[hH](?:ou|on|ei)/.test(name) || /^[aeiouAEIOU][a-z]/.test(name)) && !/^us/i.test(name)
+    return ((/^[hH](?:ou|on|ei)/.test(name) || /^[aeiouAEIOU][a-z]/.test(name)) && !/^(?:use?|uni([^nmd]|mo)|one|once)/i.test(name)
         ? "an "
         : "a ") + name;
 }
@@ -136,7 +158,15 @@ function buildNamespace(ref, ns) {
         push((config.es6 ? "const" : "var") + " " + escapeName(ns.name) + " = {};");
     }
 
+    var seenNames = new Set();
     ns.nestedArray.forEach(function(nested) {
+        // Only check names of elements that are emitted below
+        if (!(nested instanceof Enum || nested instanceof Namespace) || nested instanceof Service && !config.service)
+            return;
+        var name = escapeName(nested.name);
+        if (seenNames.has(name))
+            throw Error("duplicate generated name '" + name + "'");
+        seenNames.add(name);
         if (nested instanceof Enum)
             buildEnum(ns.name, nested);
         else if (nested instanceof Namespace)
@@ -161,27 +191,26 @@ var shortVars = {
     "w": "writer",
     "m": "message",
     "t": "tag",
+    "t2": "tag2",
+    "u": "wireType",
     "l": "length",
+    "s": "start",
     "c": "end", "c2": "end2",
     "k": "key",
+    "v": "value",
     "ks": "keys", "ks2": "keys2",
     "e": "error",
     "f": "impl",
     "o": "options",
     "d": "object",
     "n": "long",
-    "p": "properties"
+    "p": "properties",
+    "z": "_end",
+    "q": "_depth",
+    "g": "_target"
 };
 
-function beautifyCode(code) {
-    // Add semicolons
-    code = UglifyJS.minify(code, {
-        compress: false,
-        mangle: false,
-        output: { beautify: true }
-    }).code;
-    // Properly beautify
-    var ast = espree.parse(code);
+function beautifyAst(ast) {
     estraverse.replace(ast, {
         enter: function(node, parent) {
             // rename short vars
@@ -201,12 +230,9 @@ function beautifyCode(code) {
             return undefined;
         }
     });
-    code = escodegen.generate(ast, {
-        format: {
-            newline: "\n",
-            quotes: "double"
-        }
-    });
+}
+
+function addWireComments(code) {
     // Add id, wireType comments
     if (config.comments)
         code = code.replace(/\.uint32\((\d+)\)/g, function($0, $1) {
@@ -223,11 +249,165 @@ var renameVars = {
     "util": "$util"
 };
 
-function buildFunction(type, functionName, gen, scope) {
-    var code = gen.toString(functionName)
-        .replace(/((?!\.)types\[\d+])(\.values)/g, "$1"); // enums: use types[N] instead of reflected types[N].values
+var globalVars = new Set([
+    "AbortController",
+    "AbortSignal",
+    "AggregateError",
+    "Array",
+    "ArrayBuffer",
+    "Atomics",
+    "BigInt",
+    "BigInt64Array",
+    "BigUint64Array",
+    "Blob",
+    "Boolean",
+    "Buffer",
+    "DataView",
+    "Date",
+    "DOMException",
+    "Error",
+    "Event",
+    "EventTarget",
+    "EvalError",
+    "File",
+    "FinalizationRegistry",
+    "Float32Array",
+    "Float64Array",
+    "FormData",
+    "Function",
+    "Headers",
+    "Infinity",
+    "Int8Array",
+    "Int16Array",
+    "Int32Array",
+    "Intl",
+    "JSON",
+    "Map",
+    "Math",
+    "MessageChannel",
+    "MessagePort",
+    "NaN",
+    "Number",
+    "Object",
+    "Promise",
+    "Proxy",
+    "RangeError",
+    "ReadableStream",
+    "ReferenceError",
+    "Reflect",
+    "RegExp",
+    "Request",
+    "Response",
+    "Set",
+    "SharedArrayBuffer",
+    "String",
+    "Symbol",
+    "SyntaxError",
+    "TextDecoder",
+    "TextEncoder",
+    "TransformStream",
+    "TypeError",
+    "URIError",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Uint16Array",
+    "Uint32Array",
+    "URL",
+    "URLSearchParams",
+    "WebAssembly",
+    "WeakMap",
+    "WeakRef",
+    "WeakSet",
+    "WritableStream",
+    "clearInterval",
+    "clearTimeout",
+    "decodeURI",
+    "decodeURIComponent",
+    "encodeURI",
+    "encodeURIComponent",
+    "escape",
+    "fetch",
+    "globalThis",
+    "isFinite",
+    "isNaN",
+    "parseFloat",
+    "parseInt",
+    "queueMicrotask",
+    "setInterval",
+    "setTimeout",
+    "structuredClone",
+    "undefined",
+    "unescape"
+]);
 
-    var ast = espree.parse(code);
+function globalRef(name) {
+    globalRefs.add(name);
+    return "$" + name;
+}
+
+function floatDefaultLiteral(value) {
+    if (Object.is(value, -0))
+        return "-0";
+    if (value === Infinity)
+        return globalRef("Infinity");
+    if (value === -Infinity)
+        return "-" + globalRef("Infinity");
+    if (Number.isNaN(value))
+        return globalRef("NaN");
+    return JSON.stringify(value);
+}
+
+function isIdentifierReference(node, parent) {
+    if (!parent)
+        return true;
+    switch (parent.type) {
+        case "MemberExpression":
+            return parent.object === node || parent.computed;
+        case "Property":
+            return parent.value === node || parent.computed;
+        case "VariableDeclarator":
+            return parent.id !== node;
+        case "FunctionDeclaration":
+        case "FunctionExpression":
+            return parent.id !== node && parent.params.indexOf(node) < 0;
+        case "CatchClause":
+            return parent.param !== node;
+        case "AssignmentExpression":
+        case "AssignmentPattern":
+            return parent.left !== node;
+        case "UpdateExpression":
+        case "BreakStatement":
+        case "ContinueStatement":
+        case "LabeledStatement":
+            return false;
+        default:
+            return true;
+    }
+}
+
+function buildFunction(type, functionName, gen, scope) {
+    var code = gen.toString();
+    var ast = espree.parse("(" + code + ");");
+
+    function rootMemberRef(object) {
+        var ref = {
+            "type": "Identifier",
+            "name": "$root"
+        };
+        var parts = objectPath(object);
+        for (var i = 0; i < parts.length; ++i)
+            ref = {
+                "type": "MemberExpression",
+                "computed": false,
+                "object": ref,
+                "property": {
+                    "type": "Identifier",
+                    "name": parts[i]
+                }
+            };
+        return ref;
+    }
+
     /* eslint-disable no-extra-parens */
     estraverse.replace(ast, {
         enter: function(node, parent) {
@@ -243,40 +423,70 @@ function buildFunction(type, functionName, gen, scope) {
                     "type": "Identifier",
                     "name": renameVars[node.name]
                 };
-            // replace this.ctor with the actual ctor
-            if (
-                node.type === "MemberExpression"
-             && node.object.type === "ThisExpression"
-             && node.property.type === "Identifier" && node.property.name === "ctor"
-            )
+            if (node.type === "Identifier" && globalVars.has(node.name) && isIdentifierReference(node, parent))
                 return {
                     "type": "Identifier",
-                    "name": "$root" + type.fullName
+                    "name": globalRef(node.name)
                 };
+            // replace generated constructor alias with the actual ctor
+            if (
+                node.type === "Identifier"
+             && node.name === "C"
+             && (
+                    (parent.type === "NewExpression" && parent.callee === node)
+                 || (parent.type === "BinaryExpression" && parent.operator === "instanceof" && parent.right === node)
+                )
+            )
+                return rootMemberRef(type);
+            // replace types[N].ctor with the field's actual type constructor
+            if (
+                node.type === "MemberExpression"
+             && node.object.type === "MemberExpression"
+             && node.object.object.type === "Identifier" && node.object.object.name === "types"
+             && node.object.property.type === "Literal"
+             && node.property.type === "Identifier" && node.property.name === "ctor"
+            )
+                return rootMemberRef(type.fieldsArray[node.object.property.value].resolvedType);
+            // replace types[N].values with the field's actual enum object
+            if (
+                node.type === "MemberExpression"
+             && node.object.type === "MemberExpression"
+             && node.object.object.type === "Identifier" && node.object.object.name === "types"
+             && node.object.property.type === "Literal"
+             && node.property.type === "Identifier" && node.property.name === "values"
+            )
+                return rootMemberRef(type.fieldsArray[node.object.property.value].resolvedType);
+            // replace types[N].valuesById with the field's actual enum object
+            if (
+                node.type === "MemberExpression"
+             && node.object.type === "MemberExpression"
+             && node.object.object.type === "Identifier" && node.object.object.name === "types"
+             && node.object.property.type === "Literal"
+             && node.property.type === "Identifier" && node.property.name === "valuesById"
+            )
+                return rootMemberRef(type.fieldsArray[node.object.property.value].resolvedType);
             // replace types[N] with the field's actual type
             if (
                 node.type === "MemberExpression"
              && node.object.type === "Identifier" && node.object.name === "types"
              && node.property.type === "Literal"
             )
-                return {
-                    "type": "Identifier",
-                    "name": "$root" + type.fieldsArray[node.property.value].resolvedType.fullName
-                };
+                return rootMemberRef(type.fieldsArray[node.property.value].resolvedType);
             return undefined;
         }
     });
     /* eslint-enable no-extra-parens */
+    if (config.beautify)
+        beautifyAst(ast);
+
+    ast = ast.body[0].expression;
     code = escodegen.generate(ast, {
         format: {
             newline: "\n",
             quotes: "double"
         }
     });
-
-    if (config.beautify)
-        code = beautifyCode(code);
-
+    code = addWireComments(code);
     code = code.replace(/ {4}/g, "\t");
 
     var hasScope = scope && Object.keys(scope).length,
@@ -290,7 +500,7 @@ function buildFunction(type, functionName, gen, scope) {
 
     var lines = code.split(/\n/g);
     if (isCtor) // constructor
-        push(lines[0]);
+        push((config.es6 ? "const " : "var ") + escapeName(type.name) + " = " + lines[0]);
     else if (hasScope) // enclose in an iife
         push(escapeName(type.name) + "." + escapeName(functionName) + " = (function(" + Object.keys(scope).map(escapeName).join(", ") + ") { return " + lines[0]);
     else
@@ -304,15 +514,21 @@ function buildFunction(type, functionName, gen, scope) {
         indent = prev;
     });
     if (isCtor)
-        push("}");
+        push("};");
     else if (hasScope)
         push("};})(" + Object.keys(scope).map(function(key) { return scope[key]; }).join(", ") + ");");
     else
         push("};");
 }
 
-function toJsType(field) {
+function toJsType(field, parentIsInterface = false, withNarrowing = false) {
     var type;
+
+    // With null semantics, interfaces are composed from interfaces and messages from messages
+    // Without null semantics, child types depend on the --force-message flag
+    var asInterface = config["null-semantics"]
+        ? parentIsInterface && !(field.resolvedType instanceof protobuf.Enum)
+        : !(field.resolvedType instanceof protobuf.Enum || config.forceMessage);
 
     switch (field.type) {
         case "double":
@@ -341,10 +557,19 @@ function toJsType(field) {
             type = "Uint8Array";
             break;
         default:
-            if (field.resolve().resolvedType)
-                type = exportName(field.resolvedType, !(field.resolvedType instanceof protobuf.Enum || config.forceMessage));
-            else
+            if (field.resolve().resolvedType) {
+                if (field.resolvedType instanceof protobuf.Type)
+                    type = withNarrowing
+                        ? shapeName(field.resolvedType)
+                        : asInterface
+                        ? propertiesName(field.resolvedType)
+                        : exportName(field.resolvedType, asInterface);
+                else
+                    type = exportName(field.resolvedType, asInterface);
+            }
+            else {
                 type = "*"; // should not happen
+            }
             break;
     }
     if (field.map)
@@ -354,36 +579,197 @@ function toJsType(field) {
     return type;
 }
 
+function toJsTypeWithNullability(field) {
+    var jsType = toJsType(field, /* parentIsInterface = */ false);
+    if (config["null-semantics"]) {
+        // With semantic nulls, fields are nullable if they are explicitly optional or part of a one-of
+        // Maps, repeated values and fields with implicit defaults are never null after construction
+        // Members are never undefined, at a minimum they are initialized to null
+        if (isNullable(field))
+            jsType = jsType + "|null";
+    } else {
+        // Without semantic nulls, everything is optional in proto3
+        // Keep |undefined for backwards compatibility
+        if (field.optional && !field.map && !field.repeated && (field.resolvedType instanceof protobuf.Type || config["null-defaults"]) || field.partOf)
+            jsType = jsType + "|null|undefined";
+    }
+    return jsType;
+}
+
+function toPropName(field, optional) {
+    var prop = util.safeProp(field.name); // either .name or ["name"]
+    prop = prop.substring(1, prop.charAt(0) === "[" ? prop.length - 1 : prop.length);
+    return optional ? "[" + prop + "]" : prop;
+}
+
+function toTypePropName(name, optional) {
+    var prop = util.safeProp(name); // either .name or ["name"]
+    if (prop.charAt(0) === ".")
+        prop = prop.substring(1);
+    else
+        prop = JSON.parse(prop.substring(1, prop.length - 1));
+    if (!/^[$\w]+$/.test(prop) || util.patterns.reservedRe.test(prop))
+        prop = JSON.stringify(prop);
+    return prop + (optional ? "?" : "");
+}
+
+function isNullable(field) {
+    return field.hasPresence && !field.required;
+}
+
+function propertiesName(type) {
+    return exportName(type) + ".$Properties";
+}
+
+function shapeName(type) {
+    return exportName(type) + ".$Shape";
+}
+
+function narrowedType(type) {
+    return exportName(type) + " & " + shapeName(type);
+}
+
+function oneofType(oneof, selectedField) {
+    var props = [ toTypePropName(oneof.name, true) + ": " + (selectedField ? JSON.stringify(selectedField.name) : "undefined") ];
+    oneof.oneof.forEach(function(fieldName) {
+        var field = oneof.parent.fields[fieldName];
+        props.push(toTypePropName(field.name, field !== selectedField) + ": " + (field === selectedField ? toJsType(field, true, true) : "null"));
+    });
+    return "{ " + props.join("; ") + " }";
+}
+
+function oneofTypes(type) {
+    return type.oneofsArray.filter(function(oneof) {
+        return !oneof.isProto3Optional;
+    }).map(function(oneof) {
+        oneof.resolve();
+        var cases = [ oneofType(oneof) ];
+        oneof.oneof.forEach(function(fieldName) {
+            cases.push(oneofType(oneof, oneof.parent.fields[fieldName]));
+        });
+        return "(" + cases.join("|") + ")";
+    });
+}
+
+function hasNarrowing(type, seen) {
+    if (!seen)
+        seen = {};
+    if (seen[type.fullName])
+        return false;
+    seen[type.fullName] = true;
+    if (type.oneofsArray.some(function(oneof) { return !oneof.isProto3Optional; })) {
+        delete seen[type.fullName];
+        return true;
+    }
+    var narrowed = type.fieldsArray.some(function(field) {
+        field.resolve();
+        return field.resolvedType instanceof protobuf.Type && hasNarrowing(field.resolvedType, seen);
+    });
+    delete seen[type.fullName];
+    return narrowed;
+}
+
+function returnTags(typeName, description, tsType) {
+    return [ "@returns {" + (tsType || typeName) + "} " + description ];
+}
+
+function propertyType(field, withNarrowing) {
+    var jsType = toJsType(field, /* parentIsInterface = */ true, withNarrowing);
+    var nullable = false;
+    if (config["null-semantics"]) {
+        // With semantic nulls, only explicit optional fields and one-of members can be set to null
+        // Implicit fields (proto3), maps and lists can be omitted, but if specified must be non-null
+        // Implicit fields will take their default value when the message is constructed
+        if (field.optional) {
+            if (isNullable(field))
+                jsType = jsType + "|null";
+            nullable = true;
+        }
+    }
+    else {
+        // Without semantic nulls, everything is optional in proto3
+        // Do not allow |undefined to keep backwards compatibility
+        if (field.optional) {
+            jsType = jsType + "|null";
+            nullable = true;
+        }
+    }
+    return {
+        jsType: jsType,
+        nullable: nullable
+    };
+}
+
+function shapeType(type, oneofs) {
+    if (!hasNarrowing(type))
+        return propertiesName(type);
+    var props = [];
+    type.fieldsArray.forEach(function(field) {
+        var prop = propertyType(field, /* withNarrowing = */ true);
+        props.push("  " + toTypePropName(field.name, prop.nullable) + ": " + prop.jsType + ";");
+    });
+    props.push("  " + toTypePropName("$unknowns", true) + ": Array.<Uint8Array>;");
+    return "{\n" + props.join("\n") + "\n}" + (oneofs.length ? " & (\n  " + oneofs.join("\n) & (\n  ") + "\n)" : "");
+}
+
 function buildType(ref, type) {
+    var oneofs = oneofTypes(type);
 
     if (config.comments) {
         var typeDef = [
             "Properties of " + aOrAn(type.name) + ".",
-            type.parent instanceof protobuf.Root ? "@exports " + escapeName("I" + type.name) : "@memberof " + exportName(type.parent),
-            "@interface " + escapeName("I" + type.name)
+            "@typedef {Object} " + propertiesName(type)
         ];
         type.fieldsArray.forEach(function(field) {
-            var prop = util.safeProp(field.name); // either .name or ["name"]
-            prop = prop.substring(1, prop.charAt(0) === "[" ? prop.length - 1 : prop.length);
-            var jsType = toJsType(field);
-            if (field.optional)
-                jsType = jsType + "|null";
-            typeDef.push("@property {" + jsType + "} " + (field.optional ? "[" + prop + "]" : prop) + " " + (field.comment || type.name + " " + field.name));
+            var prop = propertyType(field, /* withNarrowing = */ false);
+            typeDef.push("@property {" + prop.jsType + "} " + toPropName(field, prop.nullable) + " " + (field.comment || type.name + " " + field.name));
         });
+        if (oneofs.length) {
+            type.oneofsArray.forEach(function(oneof) {
+                if (oneof.isProto3Optional)
+                    return;
+                typeDef.push("@property {" + oneof.oneof.map(JSON.stringify).join("|") + "} [" + oneof.name + "] " + (oneof.comment || type.name + " " + oneof.name));
+            });
+        }
+        typeDef.push("@property {Array.<Uint8Array>} [$unknowns] Unknown fields preserved while decoding when enabled");
         push("");
         pushComment(typeDef);
+        push("");
+        pushComment([
+            "Properties of " + aOrAn(type.name) + ".",
+            type.parent instanceof protobuf.Root ? "@exports " + escapeName("I" + type.name) : "@memberof " + exportName(type.parent),
+            "@interface " + escapeName("I" + type.name),
+            "@augments " + propertiesName(type),
+            "@deprecated Use " + propertiesName(type) + " instead."
+        ]);
+        push("");
+        pushComment([
+            (oneofs.length ? "Narrowed shape" : "Shape") + " of " + aOrAn(type.name) + ".",
+            "@typedef {" + shapeType(type, oneofs) + "} " + shapeName(type)
+        ]);
     }
 
     // constructor
     push("");
-    pushComment([
+    var classDef = [
         "Constructs a new " + type.name + ".",
         type.parent instanceof protobuf.Root ? "@exports " + escapeName(type.name) : "@memberof " + exportName(type.parent),
         "@classdesc " + (type.comment || "Represents " + aOrAn(type.name) + "."),
-        config.comments ? "@implements " + escapeName("I" + type.name) : null,
         "@constructor",
-        "@param {" + exportName(type, true) + "=} [" + (config.beautify ? "properties" : "p") + "] Properties to set"
-    ]);
+        "@param {" + propertiesName(type) + "=} [" + (config.beautify ? "properties" : "p") + "] Properties to set"
+    ];
+    if (config.comments) {
+        type.fieldsArray.forEach(function(field) {
+            if (!field.declaringField)
+                return;
+            var jsType = toJsTypeWithNullability(field);
+            var optional = /\bundefined\b/.test(jsType);
+            var propType = optional ? jsType.replace(/\|undefined\b/g, "") : jsType;
+            classDef.push("@property {" + propType + "} " + toPropName(field, optional) + " " + (field.comment || type.name + " " + field.name));
+        });
+        classDef.push("@property {Array.<Uint8Array>} [$unknowns] Unknown fields preserved while decoding when enabled");
+    }
+    pushComment(classDef);
     buildFunction(type, type.name, Type.generateConstructor(type));
 
     // default values
@@ -391,11 +777,9 @@ function buildType(ref, type) {
     type.fieldsArray.forEach(function(field) {
         field.resolve();
         var prop = util.safeProp(field.name);
-        if (config.comments) {
+        if (config.comments && !field.declaringField) {
             push("");
-            var jsType = toJsType(field);
-            if (field.optional && !field.map && !field.repeated && (field.resolvedType instanceof Type || config["null-defaults"]) || field.partOf)
-                jsType = jsType + "|null|undefined";
+            var jsType = toJsTypeWithNullability(field);
             pushComment([
                 field.comment || type.name + " " + field.name + ".",
                 "@member {" + jsType + "} " + field.name,
@@ -406,21 +790,29 @@ function buildType(ref, type) {
             push("");
             firstField = false;
         }
+        // With semantic nulls, only explict optional fields and one-of members are null by default
+        // Otherwise use field.optional, which doesn't consider proto3, maps, repeated fields etc.
+        var nullDefault = config["null-semantics"]
+            ? isNullable(field)
+            : field.optional && config["null-defaults"];
         if (field.repeated)
             push(escapeName(type.name) + ".prototype" + prop + " = $util.emptyArray;"); // overwritten in constructor
         else if (field.map)
             push(escapeName(type.name) + ".prototype" + prop + " = $util.emptyObject;"); // overwritten in constructor
-        else if (field.partOf || field.optional && config["null-defaults"])
+        else if (field.partOf || nullDefault)
             push(escapeName(type.name) + ".prototype" + prop + " = null;"); // do not set default value for oneof members
         else if (field.long)
             push(escapeName(type.name) + ".prototype" + prop + " = $util.Long ? $util.Long.fromBits("
                     + JSON.stringify(field.typeDefault.low) + ","
                     + JSON.stringify(field.typeDefault.high) + ","
                     + JSON.stringify(field.typeDefault.unsigned)
-                + ") : " + field.typeDefault.toNumber(field.type.charAt(0) === "u") + ";");
+                + ") : " + field.typeDefault.toNumber(field.type === "uint64" || field.type === "fixed64") + ";");
         else if (field.bytes) {
             push(escapeName(type.name) + ".prototype" + prop + " = $util.newBuffer(" + JSON.stringify(Array.prototype.slice.call(field.typeDefault)) + ");");
-        } else
+        } else if ((field.type === "double" || field.type === "float") && typeof field.typeDefault === "number"
+                && (!isFinite(field.typeDefault) || Object.is(field.typeDefault, -0)))
+            push(escapeName(type.name) + ".prototype" + prop + " = " + floatDefaultLiteral(field.typeDefault) + ";");
+        else
             push(escapeName(type.name) + ".prototype" + prop + " = " + JSON.stringify(field.typeDefault) + ";");
     });
 
@@ -436,13 +828,18 @@ function buildType(ref, type) {
         }
         oneof.resolve();
         push("");
-        pushComment([
-            oneof.comment || type.name + " " + oneof.name + ".",
-            "@member {" + oneof.oneof.map(JSON.stringify).join("|") + "|undefined} " + escapeName(oneof.name),
-            "@memberof " + exportName(type),
-            "@instance"
-        ]);
-        push("Object.defineProperty(" + escapeName(type.name) + ".prototype, " + JSON.stringify(oneof.name) +", {");
+        if (oneof.isProto3Optional) {
+            push("// Virtual OneOf for proto3 optional field");
+        }
+        else {
+            pushComment([
+                oneof.comment || type.name + " " + oneof.name + ".",
+                "@member {" + oneof.oneof.map(JSON.stringify).join("|") + "|undefined} " + escapeName(oneof.name),
+                "@memberof " + exportName(type),
+                "@instance"
+            ]);
+        }
+        push(globalRef("Object") + ".defineProperty(" + escapeName(type.name) + ".prototype, " + JSON.stringify(oneof.name) +", {");
         ++indent;
             push("get: $util.oneOfGetter($oneOfFields = [" + oneof.oneof.map(JSON.stringify).join(", ") + "]),");
             push("set: $util.oneOfSetter($oneOfFields)");
@@ -457,10 +854,15 @@ function buildType(ref, type) {
             "@function create",
             "@memberof " + exportName(type),
             "@static",
-            "@param {" + exportName(type, true) + "=} [properties] Properties to set",
+            "@param {" + propertiesName(type) + "=} [properties] Properties to set",
             "@returns {" + exportName(type) + "} " + type.name + " instance"
-        ]);
-        push(escapeName(type.name) + ".create = function create(properties) {");
+        ].concat([
+            "@type {{\n" +
+            "  (properties: " + shapeName(type) + "): " + narrowedType(type) + ";\n" +
+            "  (properties?: " + propertiesName(type) + "): " + exportName(type) + ";\n" +
+            "}}"
+        ]));
+        push(escapeName(type.name) + ".create = function(properties) {");
             ++indent;
             push("return new " + escapeName(type.name) + "(properties);");
             --indent;
@@ -474,7 +876,7 @@ function buildType(ref, type) {
             "@function encode",
             "@memberof " + exportName(type),
             "@static",
-            "@param {" + exportName(type, !config.forceMessage) + "} " + (config.beautify ? "message" : "m") + " " + type.name + " message or plain object to encode",
+            "@param {" + (config.forceMessage ? exportName(type) : propertiesName(type)) + "} " + (config.beautify ? "message" : "m") + " " + type.name + " message or plain object to encode",
             "@param {$protobuf.Writer} [" + (config.beautify ? "writer" : "w") + "] Writer to encode to",
             "@returns {$protobuf.Writer} Writer"
         ]);
@@ -487,13 +889,13 @@ function buildType(ref, type) {
                 "@function encodeDelimited",
                 "@memberof " + exportName(type),
                 "@static",
-                "@param {" + exportName(type, !config.forceMessage) + "} message " + type.name + " message or plain object to encode",
+                "@param {" + (config.forceMessage ? exportName(type) : propertiesName(type)) + "} message " + type.name + " message or plain object to encode",
                 "@param {$protobuf.Writer} [writer] Writer to encode to",
                 "@returns {$protobuf.Writer} Writer"
             ]);
-            push(escapeName(type.name) + ".encodeDelimited = function encodeDelimited(message, writer) {");
+            push(escapeName(type.name) + ".encodeDelimited = function(message, writer) {");
             ++indent;
-            push("return this.encode(message, writer).ldelim();");
+            push("return this.encode(message, (writer || $Writer.create()).fork()).ldelim();");
             --indent;
             push("};");
         }
@@ -507,11 +909,11 @@ function buildType(ref, type) {
             "@memberof " + exportName(type),
             "@static",
             "@param {$protobuf.Reader|Uint8Array} " + (config.beautify ? "reader" : "r") + " Reader or buffer to decode from",
-            "@param {number} [" + (config.beautify ? "length" : "l") + "] Message length if known beforehand",
-            "@returns {" + exportName(type) + "} " + type.name,
+            "@param {number} [" + (config.beautify ? "length" : "l") + "] Message length if known beforehand"
+        ].concat(returnTags(exportName(type), type.name, narrowedType(type))).concat([
             "@throws {Error} If the payload is not a reader or valid buffer",
             "@throws {$protobuf.util.ProtocolError} If required fields are missing"
-        ]);
+        ]));
         buildFunction(type, "decode", protobuf.decoder(type));
 
         if (config.delimited) {
@@ -521,18 +923,18 @@ function buildType(ref, type) {
                 "@function decodeDelimited",
                 "@memberof " + exportName(type),
                 "@static",
-                "@param {$protobuf.Reader|Uint8Array} reader Reader or buffer to decode from",
-                "@returns {" + exportName(type) + "} " + type.name,
+                "@param {$protobuf.Reader|Uint8Array} reader Reader or buffer to decode from"
+            ].concat(returnTags(exportName(type), type.name, narrowedType(type))).concat([
                 "@throws {Error} If the payload is not a reader or valid buffer",
                 "@throws {$protobuf.util.ProtocolError} If required fields are missing"
-            ]);
-            push(escapeName(type.name) + ".decodeDelimited = function decodeDelimited(reader) {");
+            ]));
+            push(escapeName(type.name) + ".decodeDelimited = function(reader) {");
             ++indent;
                 push("if (!(reader instanceof $Reader))");
                 ++indent;
                     push("reader = new $Reader(reader);");
                 --indent;
-                push("return this.decode(reader, reader.uint32());");
+                push("return this.decode(reader, reader.size());");
             --indent;
             push("};");
         }
@@ -583,25 +985,31 @@ function buildType(ref, type) {
             "@instance",
             "@returns {Object.<string,*>} JSON object"
         ]);
-        push(escapeName(type.name) + ".prototype.toJSON = function toJSON() {");
+        push(escapeName(type.name) + ".prototype.toJSON = function() {");
         ++indent;
-            push("return this.constructor.toObject(this, $protobuf.util.toJSONOptions);");
+            push("return " + escapeName(type.name) + ".toObject(this, $protobuf.util.toJSONOptions);");
         --indent;
         push("};");
     }
 
     if (config.typeurl) {
+        var typeUrlName = type.fullName.charAt(0) === "." ? type.fullName.substring(1) : type.fullName;
         push("");
         pushComment([
-            "Gets the default type url for " + type.name,
+            "Gets the type url for " + type.name,
             "@function getTypeUrl",
             "@memberof " + exportName(type),
             "@static",
-            "@returns {string} The default type url"
+            "@param {string} [prefix] Custom type url prefix, defaults to `\"type.googleapis.com\"`",
+            "@returns {string} The type url"
         ]);
-        push(escapeName(type.name) + ".getTypeUrl = function getTypeUrl() {");
+        push(escapeName(type.name) + ".getTypeUrl = function(prefix) {");
         ++indent;
-            push("return \"type.googleapis.com/" + exportName(type) + "\";");
+            push("if (prefix === " + globalRef("undefined") + ")");
+            ++indent;
+                push("prefix = \"type.googleapis.com\";");
+            --indent;
+            push("return prefix + " + JSON.stringify("/" + typeUrlName) + ";");
         --indent;
         push("};");
     }
@@ -620,13 +1028,13 @@ function buildService(ref, service) {
         "@param {boolean} [requestDelimited=false] Whether requests are length-delimited",
         "@param {boolean} [responseDelimited=false] Whether responses are length-delimited"
     ]);
-    push("function " + escapeName(service.name) + "(rpcImpl, requestDelimited, responseDelimited) {");
+    push((config.es6 ? "const " : "var ") + escapeName(service.name) + " = function(rpcImpl, requestDelimited, responseDelimited) {");
     ++indent;
     push("$protobuf.rpc.Service.call(this, rpcImpl, requestDelimited, responseDelimited);");
     --indent;
-    push("}");
+    push("};");
     push("");
-    push("(" + escapeName(service.name) + ".prototype = Object.create($protobuf.rpc.Service.prototype)).constructor = " + escapeName(service.name) + ";");
+    push(globalRef("Object") + ".defineProperty(" + escapeName(service.name) + ".prototype = " + globalRef("Object") + ".create($protobuf.rpc.Service.prototype), \"constructor\", { value: " + escapeName(service.name) + ", writable: true, enumerable: false, configurable: true });");
 
     if (config.create) {
         push("");
@@ -640,7 +1048,7 @@ function buildService(ref, service) {
             "@param {boolean} [responseDelimited=false] Whether responses are length-delimited",
             "@returns {" + escapeName(service.name) + "} RPC service. Useful where requests and/or responses are streamed."
         ]);
-        push(escapeName(service.name) + ".create = function create(rpcImpl, requestDelimited, responseDelimited) {");
+        push(escapeName(service.name) + ".create = function(rpcImpl, requestDelimited, responseDelimited) {");
             ++indent;
             push("return new this(rpcImpl, requestDelimited, responseDelimited);");
             --indent;
@@ -650,7 +1058,8 @@ function buildService(ref, service) {
     service.methodsArray.forEach(function(method) {
         method.resolve();
         var lcName = protobuf.util.lcFirst(method.name),
-            cbName = escapeName(method.name + "Callback");
+            cbName = escapeName(method.name + "Callback"),
+            methodTypeName = escapeName(method.name);
         push("");
         pushComment([
             "Callback as used by {@link " + exportName(service) + "#" + escapeName(lcName) + "}.",
@@ -664,30 +1073,39 @@ function buildService(ref, service) {
         push("");
         pushComment([
             method.comment || "Calls " + method.name + ".",
-            "@function " + lcName,
             "@memberof " + exportName(service),
-            "@instance",
-            "@param {" + exportName(method.resolvedRequestType, !config.forceMessage) + "} request " + method.resolvedRequestType.name + " message or plain object",
-            "@param {" + exportName(service) + "." + cbName + "} callback Node-style callback called with the error, if any, and " + method.resolvedResponseType.name,
-            "@returns {undefined}",
-            "@variation 1"
+            "@typedef " + methodTypeName,
+            "@type {{",
+            "  (request: " + exportName(method.resolvedRequestType, !config.forceMessage) + ", callback: " + exportName(service) + "." + cbName + "): void;",
+            "  (request: " + exportName(method.resolvedRequestType, !config.forceMessage) + "): Promise<" + exportName(method.resolvedResponseType) + ">;",
+            "  readonly name: " + JSON.stringify(method.name) + ";",
+            "  readonly path: " + JSON.stringify(method.path) + ";",
+            "  readonly requestType: " + JSON.stringify(method.requestType) + ";",
+            "  readonly responseType: " + JSON.stringify(method.responseType) + ";",
+            "  readonly requestStream: " + (method.requestStream ? "true" : "undefined") + ";",
+            "  readonly responseStream: " + (method.responseStream ? "true" : "undefined") + ";",
+            "}}"
         ]);
-        push("Object.defineProperty(" + escapeName(service.name) + ".prototype" + util.safeProp(lcName) + " = function " + escapeName(lcName) + "(request, callback) {");
-            ++indent;
-            push("return this.rpcCall(" + escapeName(lcName) + ", $root." + exportName(method.resolvedRequestType) + ", $root." + exportName(method.resolvedResponseType) + ", request, callback);");
-            --indent;
-        push("}, \"name\", { value: " + JSON.stringify(method.name) + " });");
-        if (config.comments)
-            push("");
+        push("");
         pushComment([
             method.comment || "Calls " + method.name + ".",
-            "@function " + lcName,
-            "@memberof " + exportName(service),
-            "@instance",
-            "@param {" + exportName(method.resolvedRequestType, !config.forceMessage) + "} request " + method.resolvedRequestType.name + " message or plain object",
-            "@returns {Promise<" + exportName(method.resolvedResponseType) + ">} Promise",
-            "@variation 2"
+            "@name " + exportName(service) + "#" + lcName,
+            "@type {" + exportName(service) + "." + methodTypeName + "}"
         ]);
+        push(globalRef("Object") + ".defineProperties(" + escapeName(service.name) + ".prototype" + util.safeProp(lcName) + " = function(request, callback) {");
+            ++indent;
+            push("return $protobuf.rpc.Service.prototype.rpcCall.call(this, " + escapeName(service.name) + ".prototype" + util.safeProp(lcName) + ", $root." + exportName(method.resolvedRequestType) + ", $root." + exportName(method.resolvedResponseType) + ", request, callback);");
+            --indent;
+        push("}, {");
+            ++indent;
+            push("name: { value: " + JSON.stringify(method.name) + " },");
+            push("path: { value: " + JSON.stringify(method.path) + " },");
+            push("requestType: { value: " + JSON.stringify(method.requestType) + " },");
+            push("responseType: { value: " + JSON.stringify(method.responseType) + " },");
+            push("requestStream: { value: " + (method.requestStream ? "true" : globalRef("undefined")) + " },");
+            push("responseStream: { value: " + (method.responseStream ? "true" : globalRef("undefined")) + " }");
+            --indent;
+        push("});");
     });
 }
 
@@ -696,7 +1114,7 @@ function buildEnum(ref, enm) {
     push("");
     var comment = [
         enm.comment || enm.name + " enum.",
-        enm.parent instanceof protobuf.Root ? "@exports " + escapeName(enm.name) : "@name " + exportName(enm),
+        "@name " + exportName(enm),
         config.forceEnumString ? "@enum {string}" : "@enum {number}",
     ];
     Object.keys(enm.values).forEach(function(key) {
@@ -709,7 +1127,7 @@ function buildEnum(ref, enm) {
     else
         push(escapeName(ref) + "." + escapeName(enm.name) + " = (function() {");
     ++indent;
-        push((config.es6 ? "const" : "var") + " valuesById = {}, values = Object.create(valuesById);");
+        push((config.es6 ? "const" : "var") + " valuesById = " + globalRef("Object") + ".create(null), values = " + globalRef("Object") + ".create(valuesById);");
         var aliased = [];
         Object.keys(enm.values).forEach(function(key) {
             var valueId = enm.values[key];

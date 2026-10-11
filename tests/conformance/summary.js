@@ -1,0 +1,234 @@
+"use strict";
+
+var fs = require("fs");
+
+exports.read = function(logFile, testListLogFile) {
+    var tests = readTests(testListLogFile),
+        failures = readFailures(logFile),
+        skips = readSkips(logFile);
+
+    return {
+        summary: readRunnerSummary(logFile),
+        totals: summarize(tests, failures, skips)
+    };
+};
+
+exports.readText = readText;
+
+function readTests(file) {
+    var log,
+        tests = Object.create(null),
+        pattern = /SKIPPED,\s*test=([^\s]+)/g,
+        match,
+        name;
+
+    if (!file || !fs.existsSync(file))
+        return [];
+
+    log = readText(file);
+    while ((match = pattern.exec(log)) !== null) {
+        name = match[1];
+        tests[name] = classifyTest(name);
+    }
+    return Object.keys(tests).sort().map(function(testName) {
+        var test = tests[testName];
+        test.name = testName;
+        return test;
+    });
+}
+
+function readFailures(file) {
+    var log,
+        failures = Object.create(null),
+        pattern = /ERROR,\s*test=([^\s:]+)/g,
+        match;
+
+    if (!file || !fs.existsSync(file))
+        return failures;
+
+    log = readText(file);
+    while ((match = pattern.exec(log)) !== null)
+        failures[match[1]] = true;
+    return failures;
+}
+
+function readSkips(file) {
+    var log,
+        skips = Object.create(null),
+        pattern = /SKIPPED,\s*test=([^\s]+)/g,
+        match;
+
+    if (!file || !fs.existsSync(file))
+        return skips;
+
+    log = readText(file);
+    while ((match = pattern.exec(log)) !== null)
+        skips[match[1]] = true;
+    return skips;
+}
+
+function readRunnerSummary(file) {
+    var log,
+        match,
+        pattern = /CONFORMANCE SUITE [^:]+: (\d+) successes, (\d+) skipped, (\d+) expected failures, (\d+) unexpected failures\./g,
+        summary = null;
+
+    if (!file || !fs.existsSync(file))
+        return null;
+
+    log = readText(file);
+    while ((match = pattern.exec(log)) !== null) {
+        if (!summary)
+            summary = {
+                successes: 0,
+                skipped: 0,
+                expectedFailures: 0,
+                unexpectedFailures: 0
+            };
+        summary.successes += Number(match[1]);
+        summary.skipped += Number(match[2]);
+        summary.expectedFailures += Number(match[3]);
+        summary.unexpectedFailures += Number(match[4]);
+    }
+    return summary;
+}
+
+function summarize(tests, failures, skips) {
+    var binaryTests = tests.filter(function(test) {
+        return test.format === "binary";
+    });
+
+    return {
+        overall: summarizeTests(tests, failures, skips),
+        byRequirement: summarizeGroups(tests, failures, skips, "requirement", requirementOrder()),
+        byFormat: summarizeGroups(tests, failures, skips, "format", formatOrder()),
+        byFormatRequirement: summarizeMatrix(tests, failures, skips, "format", "requirement", formatOrder(), requirementOrder()),
+        byBinarySyntax: summarizeGroups(binaryTests, failures, skips, "syntax", syntaxOrder()),
+        byBinarySyntaxRequirement: summarizeMatrix(binaryTests, failures, skips, "syntax", "requirement", syntaxOrder(), requirementOrder())
+    };
+}
+
+function summarizeGroups(tests, failures, skips, property, groups) {
+    var out = Object.create(null);
+    groups.forEach(function(group) {
+        var groupTests = tests.filter(function(test) {
+            return test[property] === group.id;
+        });
+        if (groupTests.length)
+            out[group.id] = Object.assign({ id: group.id, label: group.label }, summarizeTests(groupTests, failures, skips));
+    });
+    return out;
+}
+
+function summarizeMatrix(tests, failures, skips, rowProperty, columnProperty, rows, columns) {
+    var out = Object.create(null);
+    rows.forEach(function(row) {
+        var rowTests = tests.filter(function(test) {
+            return test[rowProperty] === row.id;
+        });
+        if (rowTests.length) {
+            out[row.id] = Object.create(null);
+            columns.forEach(function(column) {
+                var columnTests = rowTests.filter(function(test) {
+                    return test[columnProperty] === column.id;
+                });
+                if (columnTests.length)
+                    out[row.id][column.id] = Object.assign({ id: column.id, label: column.label }, summarizeTests(columnTests, failures, skips));
+            });
+        }
+    });
+    return out;
+}
+
+function summarizeTests(tests, failures, skips) {
+    var total = tests.length,
+        passed = 0,
+        failed = 0,
+        skipped = 0;
+
+    tests.forEach(function(test) {
+        if (failures[test.name]) {
+            ++failed;
+        } else if (skips[test.name]) {
+            ++skipped;
+        } else {
+            ++passed;
+        }
+    });
+
+    return {
+        total: total,
+        passed: passed,
+        failed: failed,
+        skipped: skipped,
+        passPercent: percent(passed, total)
+    };
+}
+
+function classifyTest(name) {
+    return {
+        requirement: name.indexOf("Required.") === 0 ? "required" : "recommended",
+        format: classifyFormat(name),
+        syntax: classifySyntax(name)
+    };
+}
+
+function classifyFormat(name) {
+    if (/(^|\.)TextFormat(Input|Output)(\.|$)/.test(name))
+        return "textFormat";
+    if (/(^|\.)(JSPB|Jspb)(Input|Output)(\.|$)/.test(name))
+        return "jspb";
+    if (/(^|\.)Json(Input|Output)(\.|$)/.test(name) || /\.Validator$/.test(name))
+        return "json";
+    if (/(^|\.)Protobuf(Input|Output)(\.|$)/.test(name))
+        return "binary";
+    return "other";
+}
+
+function classifySyntax(name) {
+    var parts = name.split(".");
+    if (parts[1] === "Proto2")
+        return "proto2";
+    if (parts[1] === "Proto3")
+        return "proto3";
+    if (/^Edition/.test(parts[1]))
+        return "editions";
+    return "other";
+}
+
+function formatOrder() {
+    return [
+        { id: "binary", label: "Binary" },
+        { id: "json", label: "ProtoJSON" },
+        { id: "textFormat", label: "Text Format" },
+        { id: "jspb", label: "JSPB" },
+        { id: "other", label: "Other" }
+    ];
+}
+
+function syntaxOrder() {
+    return [
+        { id: "proto2", label: "Proto2" },
+        { id: "proto3", label: "Proto3" },
+        { id: "editions", label: "Editions" },
+        { id: "other", label: "Other" }
+    ];
+}
+
+function requirementOrder() {
+    return [
+        { id: "required", label: "Required" },
+        { id: "recommended", label: "Recommended" }
+    ];
+}
+
+function percent(value, total) {
+    return total ? value / total : 0;
+}
+
+function readText(file) {
+    var buffer = fs.readFileSync(file);
+    return buffer[0] === 0xff && buffer[1] === 0xfe
+        ? buffer.toString("utf16le")
+        : buffer.toString("utf8");
+}

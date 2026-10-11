@@ -23,6 +23,14 @@ tape.test("reflection objects", function(test) {
     test.same(obj.options, { a: 1, b: 2 }, "should accept undefined as options");    
     obj.setOption("c", 3);
     test.same(obj.options, { a: 1, b: 2, c: 3 }, "should set single options");
+    obj.setOption("__proto__", { marker: true });
+    test.equal(Object.getPrototypeOf(obj.options), Object.prototype, "should keep the options object shape");
+    test.notOk(Object.prototype.hasOwnProperty.call(obj.options, "__proto__"), "should ignore reserved option names");
+    test.equal(obj.getOption("toString"), undefined, "should not read inherited properties as options");
+    obj.setOption("toString", "custom", true);
+    test.equal(obj.getOption("toString"), "custom", "should set shadowing option names when unset");
+    obj.setOption("toString", "ignored", true);
+    test.equal(obj.getOption("toString"), "custom", "should preserve shadowing option names when already set");
 
     obj.setParsedOption("opt1", {a: 1, b: 2});
     test.same(obj.parsedOptions, [{"opt1": {a: 1, b: 2}}], "should set single parsed option");
@@ -34,11 +42,27 @@ tape.test("reflection objects", function(test) {
     test.same(obj.parsedOptions, [{"opt1": {a: 1, b: 2}}, {"opt1": {a: 3, b: 4}}, {"opt2": {x: 1, a: {b :5}}}], "should merge new property path in existing option");
     obj.setParsedOption("opt2", 6, "x");
     test.same(obj.parsedOptions, [{"opt1": {a: 1, b: 2}}, {"opt1": {a: 3, b: 4}}, {"opt2": {x: [1,6], a: {b :5}}}], "should convert property to array when set more than once");
+    obj.setParsedOption("__proto__", { marker: true });
+    test.equal(obj.parsedOptions.length, 3, "should ignore reserved parsed option names");
 
 
     test.equal(obj.toString(), "ReflectionObject Test", "should convert to a string (even if not part of a root)");
     obj.name = "";
     test.equal(obj.toString(), "ReflectionObject", "should convert to a string even with no full name");
 
+    test.end();
+});
+
+tape.test("parser - parsed option object members use own-property checks", function(test) {
+    var root = protobuf.parse("syntax = \"proto2\";\n" +
+        "import \"google/protobuf/descriptor.proto\";\n" +
+        "message Opt { optional string constructor = 1; optional string to_string = 2; }\n" +
+        "extend google.protobuf.MessageOptions { optional Opt opt = 50000; }\n" +
+        "message M { option (opt) = { constructor: \"ctor\" to_string: \"str\" }; }").root,
+        M = root.lookupType("M"),
+        option = M.parsedOptions[0]["(opt)"];
+
+    test.equal(option.constructor, "ctor", "keeps constructor option member as data");
+    test.equal(option.to_string, "str", "keeps to_string option member as data");
     test.end();
 });

@@ -4,58 +4,95 @@ on:
     branches:
     - master
   pull_request:
+    types: [assigned, opened, synchronize, reopened, labeled]
+env:
+  MIN_NODE_VERSION: &min_node_version "12"
+  NPM_CONFIG_AUDIT: "false"
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
-    - uses: actions/setup-node@v1
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
       with:
-        node-version: "12"
+        node-version: "lts/*"
     - name: "Install dependencies"
       run: npm install
     - name: "Lint sources"
       run: npm run lint:sources -- --max-warnings 0
     - name: "Lint types"
       run: npm run lint:types
-  build:
-    runs-on: ubuntu-latest
-    needs: lint
-    steps:
-    - uses: actions/checkout@v1
-    - uses: actions/setup-node@v1
-      with:
-        node-version: "12"
-    - name: "Install dependencies"
-      run: npm install && (cd cli && npm install)
-    - name: "Build distribution files"
-      run: npm run build
   test:
     runs-on: ubuntu-latest
-    needs: build
     strategy:
       matrix:
-        node_version: ["4", "4.3.2", "6", "8", "10", "12"]
+        node_version: [*min_node_version, "lts/*"]
     steps:
-    - uses: actions/checkout@v1
-    - uses: actions/setup-node@v1
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
       with:
         node-version: ${{ matrix.node_version }}
+    - name: "Use npm 8 on Node 12"
+      if: ${{ matrix.node_version == '12' }}
+      run: npm install -g npm@8
     - name: "Install dependencies"
       run: npm install
     - name: "Test sources"
       run: npm run test:sources
     - name: "Test types"
       run: npm run test:types
-  bench:
+  benchmark:
     runs-on: ubuntu-latest
-    needs: build
     steps:
-    - uses: actions/checkout@v1
-    - uses: actions/setup-node@v1
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
       with:
-        node-version: "12"
+        node-version: "lts/*"
+    - name: "Install protoc"
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: "Install dependencies"
       run: npm install
+    - name: "Install benchmark dependencies"
+      run: npm --prefix bench install
+    - name: "Generate benchmark fixtures"
+      run: npm --prefix bench run generate
     - name: "Run benchmark"
-      run: npm run bench
+      run: |
+        set -o pipefail
+        npm run bench 2>&1 | tee "$RUNNER_TEMP/bench.log"
+        {
+          echo '```'
+          sed -r 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/bench.log"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
+      with:
+        node-version: "lts/*"
+    - name: "Install dependencies"
+      run: npm install --ignore-scripts
+    - name: "Install CLI dependencies"
+      run: npm --prefix cli install --ignore-scripts
+    - uses: ./.github/actions/conformance
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: conformance-results
+        path: |
+          tests/conformance/out/conformance-tests.log
+          tests/conformance/out/static/conformance.json
+          tests/conformance/out/static/conformance.log
+          tests/conformance/out/static/failing_tests.txt
+          tests/conformance/out/static-plugin/conformance.json
+          tests/conformance/out/static-plugin/conformance.log
+          tests/conformance/out/static-plugin/failing_tests.txt
+          tests/conformance/out/reflect/conformance.json
+          tests/conformance/out/reflect/conformance.log
+          tests/conformance/out/reflect/failing_tests.txt
+          tests/conformance/out/reflect-plugin/conformance.json
+          tests/conformance/out/reflect-plugin/conformance.log
+          tests/conformance/out/reflect-plugin/failing_tests.txt
+        if-no-files-found: ignore

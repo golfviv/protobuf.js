@@ -9,13 +9,19 @@ var setCommentRe = /^ *[*/]+ */,
     setCommentAltRe = /^\s*\*?\/*/,
     setCommentSplitRe = /\n/g,
     whitespaceRe = /\s/,
-    unescapeRe = /\\(.?)/g;
+    unescapeRe = /\\([0-7]{1,3}|[xX][0-9a-fA-F]{1,2}|.?)/g;
 
 var unescapeMap = {
-    "0": "\0",
+    "a": "\x07",
+    "b": "\b",
+    "f": "\f",
     "r": "\r",
     "n": "\n",
-    "t": "\t"
+    "t": "\t",
+    "v": "\v",
+    "?": "?",
+    "'": "'",
+    "\"": "\""
 };
 
 /**
@@ -27,6 +33,11 @@ var unescapeMap = {
  */
 function unescape(str) {
     return str.replace(unescapeRe, function($0, $1) {
+        var first = $1.charAt(0);
+        if (first >= "0" && first <= "7")
+            return String.fromCharCode(parseInt($1, 8) & 255);
+        if (first === "x" || first === "X")
+            return String.fromCharCode(parseInt($1.substring(1), 16));
         switch ($1) {
             case "\\":
             case "":
@@ -197,9 +208,7 @@ function tokenize(source, alternateCommentMode) {
 
         // see if remaining line matches comment pattern
         var lineText = source.substring(startOffset, endOffset);
-        // look for 1 or 2 slashes since startOffset would already point past
-        // the first slash that started the comment.
-        var isComment = /^\s*\/{1,2}/.test(lineText);
+        var isComment = /^\s*\/\//.test(lineText);
         return isComment;
     }
 
@@ -227,6 +236,7 @@ function tokenize(source, alternateCommentMode) {
             curr,
             start,
             isDoc,
+            nextLineIsComment,
             isLeadingComment = offset === 0;
         do {
             if (offset === length)
@@ -268,7 +278,7 @@ function tokenize(source, alternateCommentMode) {
                         // check for double-slash comments, consolidating consecutive lines
                         start = offset;
                         isDoc = false;
-                        if (isDoubleSlashCommentLine(offset)) {
+                        if (isDoubleSlashCommentLine(offset - 1)) {
                             isDoc = true;
                             do {
                                 offset = findEndOfLine(offset);
@@ -280,7 +290,11 @@ function tokenize(source, alternateCommentMode) {
                                     // Trailing comment cannot not be multi-line
                                     break;
                                 }
-                            } while (isDoubleSlashCommentLine(offset));
+                                nextLineIsComment = isDoubleSlashCommentLine(offset);
+                                if (nextLineIsComment) {
+                                    line++;
+                                }
+                            } while (nextLineIsComment);
                         } else {
                             offset = Math.min(length, findEndOfLine(offset) + 1);
                         }

@@ -3,7 +3,15 @@ module.exports = Field;
 
 // extends ReflectionObject
 var ReflectionObject = require("./object");
-((Field.prototype = Object.create(ReflectionObject.prototype)).constructor = Field).className = "Field";
+Field.prototype = Object.create(ReflectionObject.prototype, {
+    constructor: {
+        value: Field,
+        writable: true,
+        enumerable: false,
+        configurable: true
+    }
+});
+Field.className = "Field";
 
 var Enum  = require("./enum"),
     types = require("./types"),
@@ -11,7 +19,7 @@ var Enum  = require("./enum"),
 
 var Type; // cyclic
 
-var ruleRe = /^required|optional|repeated$/;
+var ruleRe = /^(?:required|optional|repeated)$/;
 
 /**
  * Constructs a new message field instance. Note that {@link MapField|map fields} have their own class.
@@ -35,7 +43,17 @@ var ruleRe = /^required|optional|repeated$/;
  * @throws {TypeError} If arguments are invalid
  */
 Field.fromJSON = function fromJSON(name, json) {
-    return new Field(name, json.id, json.type, json.rule, json.extend, json.options, json.comment);
+    var field = new Field(name, json.id, json.type, json.rule, json.extend, json.options, json.comment);
+    if (json.edition)
+        field._edition = json.edition;
+    if (json.protoName)
+        field.protoName = json.protoName;
+    if (json.jsonName !== undefined)
+        field.jsonName = json.jsonName;
+    else if (json.options && json.options.json_name !== undefined)
+        field.jsonName = json.options.json_name;
+    field._defaultEdition = "proto3";  // For backwards-compatibility.
+    return field;
 };
 
 /**
@@ -82,9 +100,6 @@ function Field(name, id, type, rule, extend, options, comment) {
      * Field rule, if any.
      * @type {string|undefined}
      */
-    if (rule === "proto3_optional") {
-        rule = "optional";
-    }
     this.rule = rule && rule !== "optional" ? rule : undefined; // toJSON
 
     /**
@@ -104,18 +119,6 @@ function Field(name, id, type, rule, extend, options, comment) {
      * @type {string|undefined}
      */
     this.extend = extend || undefined; // toJSON
-
-    /**
-     * Whether this field is required.
-     * @type {boolean}
-     */
-    this.required = rule === "required";
-
-    /**
-     * Whether this field is optional.
-     * @type {boolean}
-     */
-    this.optional = !this.required;
 
     /**
      * Whether this field is repeated.
@@ -184,50 +187,123 @@ function Field(name, id, type, rule, extend, options, comment) {
     this.declaringField = null;
 
     /**
-     * Internally remembers whether this field is packed.
-     * @type {boolean|null}
-     * @private
-     */
-    this._packed = null;
-
-    /**
      * Comment for this field.
      * @type {string|null}
      */
     this.comment = comment;
+
+    /**
+     * Field name as declared in the .proto source, if different from `name`.
+     * @type {string|undefined}
+     */
+    this.protoName = undefined;
+
+    /**
+     * JSON name, if different from the derived default.
+     * @type {string|undefined}
+     */
+    this.jsonName = undefined;
 }
 
 /**
- * Determines whether this field is packed. Only relevant when repeated and working with proto2.
+ * Determines whether this field is required.
+ * @name Field#required
+ * @type {boolean}
+ * @readonly
+ */
+Object.defineProperty(Field.prototype, "required", {
+    get: function() {
+        return this._features.field_presence === "LEGACY_REQUIRED";
+    }
+});
+
+/**
+ * Determines whether this field is not required.
+ * @name Field#optional
+ * @type {boolean}
+ * @readonly
+ */
+Object.defineProperty(Field.prototype, "optional", {
+    get: function() {
+        return !this.required;
+    }
+});
+
+/**
+ * Determines whether this field uses tag-delimited encoding.  In proto2 this
+ * corresponded to group syntax.
+ * @name Field#delimited
+ * @type {boolean}
+ * @readonly
+ */
+Object.defineProperty(Field.prototype, "delimited", {
+    get: function() {
+        return this.resolvedType instanceof Type &&
+            this._features.message_encoding === "DELIMITED";
+    }
+});
+
+/**
+ * Determines whether this field is packed. Only relevant when repeated.
  * @name Field#packed
  * @type {boolean}
  * @readonly
  */
 Object.defineProperty(Field.prototype, "packed", {
     get: function() {
-        // defaults to packed=true if not explicity set to false
-        if (this._packed === null)
-            this._packed = this.getOption("packed") !== false;
-        return this._packed;
+        return this._features.repeated_field_encoding === "PACKED";
     }
 });
+
+/**
+ * Determines whether this field tracks presence.
+ * @name Field#hasPresence
+ * @type {boolean}
+ * @readonly
+ */
+Object.defineProperty(Field.prototype, "hasPresence", {
+    get: function() {
+        if (this.repeated || this.map) {
+            return false;
+        }
+        return this.partOf || // oneofs
+            this.declaringField || this.extensionField || // extensions
+            this._features.field_presence !== "IMPLICIT";
+    }
+});
+
+/**
+ * The field name as declared in the .proto source (snake_case). Populated on resolve,
+ * falling back to `name`. Mirrors `FieldDescriptorProto.name`.
+ * @name Field#protoName
+ * @type {string}
+ * @readonly
+ */
+
+/**
+ * The JSON name of this field (lowerCamelCase per protoc's `ToJsonName`, or an
+ * explicit `[json_name]`). Populated on resolve. This is the key used on ProtoJSON output.
+ * @name Field#jsonName
+ * @type {string}
+ * @readonly
+ */
 
 /**
  * @override
  */
 Field.prototype.setOption = function setOption(name, value, ifNotSet) {
-    if (name === "packed") // clear cached before setting
-        this._packed = null;
     return ReflectionObject.prototype.setOption.call(this, name, value, ifNotSet);
 };
 
 /**
  * Field descriptor.
  * @interface IField
+ * @property {string} [edition] Edition
  * @property {string} [rule="optional"] Field rule
  * @property {string} type Field type
  * @property {number} id Field id
  * @property {Object.<string,*>} [options] Field options
+ * @property {string|null} [comment] Field comment
  */
 
 /**
@@ -245,12 +321,15 @@ Field.prototype.setOption = function setOption(name, value, ifNotSet) {
 Field.prototype.toJSON = function toJSON(toJSONOptions) {
     var keepComments = toJSONOptions ? Boolean(toJSONOptions.keepComments) : false;
     return util.toObject([
-        "rule"    , this.rule !== "optional" && this.rule || undefined,
-        "type"    , this.type,
-        "id"      , this.id,
-        "extend"  , this.extend,
-        "options" , this.options,
-        "comment" , keepComments ? this.comment : undefined
+        "edition"      , this._editionToJSON(),
+        "rule"         , this.rule !== "optional" && this.rule || undefined,
+        "type"         , this.type,
+        "id"           , this.id,
+        "extend"       , this.extend,
+        "protoName"    , this.protoName !== this.name ? this.protoName : undefined,
+        "jsonName"     , this.jsonName !== util.jsonName(this.protoName || this.name) ? this.jsonName : undefined,
+        "options"      , this.options,
+        "comment"      , keepComments ? this.comment : undefined
     ]);
 };
 
@@ -270,6 +349,9 @@ Field.prototype.resolve = function resolve() {
             this.typeDefault = null;
         else // instanceof Enum
             this.typeDefault = this.resolvedType.values[Object.keys(this.resolvedType.values)[0]]; // first defined
+    } else if (this.options && this.options.proto3_optional) {
+        // proto3 scalar value marked optional; should default to null
+        this.typeDefault = null;
     }
 
     // use explicitly set default value if present
@@ -281,7 +363,7 @@ Field.prototype.resolve = function resolve() {
 
     // remove unnecessary options
     if (this.options) {
-        if (this.options.packed === true || this.options.packed !== undefined && this.resolvedType && !(this.resolvedType instanceof Enum))
+        if (this.options.packed !== undefined && this.resolvedType && !(this.resolvedType instanceof Enum))
             delete this.options.packed;
         if (!Object.keys(this.options).length)
             this.options = undefined;
@@ -289,12 +371,17 @@ Field.prototype.resolve = function resolve() {
 
     // convert to internal data type if necesssary
     if (this.long) {
-        this.typeDefault = util.Long.fromNumber(this.typeDefault, this.type.charAt(0) === "u");
+        var unsigned = this.type === "uint64" || this.type === "fixed64";
+        this.typeDefault = typeof this.typeDefault === "string"
+            ? util.Long.fromString(this.typeDefault, unsigned)
+            : util.Long.fromNumber(this.typeDefault, unsigned);
 
         /* istanbul ignore else */
         if (Object.freeze)
             Object.freeze(this.typeDefault); // long instances are meant to be immutable anyway (i.e. use small int cache that even requires it)
 
+    } else if (types.long[this.type] !== undefined && typeof this.typeDefault === "string") {
+        this.typeDefault = parseInt(this.typeDefault, 10);
     } else if (this.bytes && typeof this.typeDefault === "string") {
         var buf;
         if (util.base64.test(this.typeDefault))
@@ -313,10 +400,56 @@ Field.prototype.resolve = function resolve() {
         this.defaultValue = this.typeDefault;
 
     // ensure proper value on prototype
-    if (this.parent instanceof Type)
-        this.parent.ctor.prototype[this.name] = this.defaultValue;
+    if (this.parent instanceof Type && this.parent._ctor)
+        this.parent._ctor.prototype[this.name] = this.defaultValue;
+
+    // derive the proto/JSON names
+    if (this.protoName === undefined)
+        this.protoName = this.name;
+    if (this.jsonName === undefined)
+        this.jsonName = util.jsonName(this.protoName);
 
     return ReflectionObject.prototype.resolve.call(this);
+};
+
+/**
+ * Infers field features from legacy syntax that may have been specified differently.
+ * in older editions.
+ * @param {string|undefined} edition The edition this proto is on, or undefined if pre-editions
+ * @returns {object} The feature values to override
+ */
+Field.prototype._inferLegacyProtoFeatures = function _inferLegacyProtoFeatures(edition) {
+    if (edition !== "proto2" && edition !== "proto3") {
+        return {};
+    }
+
+    var features = {};
+
+    if (this.rule === "required") {
+        features.field_presence = "LEGACY_REQUIRED";
+    }
+    if (this.parent && types.defaults[this.type] === undefined) {
+        // We can't use resolvedType because types may not have been resolved yet.  However,
+        // legacy groups are always in the same scope as the field so we don't have to do a
+        // full scan of the tree.
+        var type = this.parent.get(this.type.split(".").pop());
+        if (type && type instanceof Type && type.group) {
+            features.message_encoding = "DELIMITED";
+        }
+    }
+    if (this.getOption("packed") === true) {
+        features.repeated_field_encoding = "PACKED";
+    } else if (this.getOption("packed") === false) {
+        features.repeated_field_encoding = "EXPANDED";
+    }
+    return features;
+};
+
+/**
+ * @override
+ */
+Field.prototype._resolveFeatures = function _resolveFeatures(edition) {
+    return ReflectionObject.prototype._resolveFeatures.call(this, this._edition || edition);
 };
 
 /**
@@ -326,6 +459,7 @@ Field.prototype.resolve = function resolve() {
  * @param {Object} prototype Target prototype
  * @param {string} fieldName Field name
  * @returns {undefined}
+ * @deprecated Legacy TypeScript decorator support. Will be removed in a future release.
  */
 
 /**
@@ -338,6 +472,7 @@ Field.prototype.resolve = function resolve() {
  * @param {T} [defaultValue] Default value
  * @returns {FieldDecorator} Decorator function
  * @template T extends number | number[] | Long | Long[] | string | string[] | boolean | boolean[] | Uint8Array | Uint8Array[] | Buffer | Buffer[]
+ * @deprecated Legacy TypeScript decorator support. Will be removed in a future release.
  */
 Field.d = function decorateField(fieldId, fieldType, fieldRule, defaultValue) {
 
@@ -355,6 +490,11 @@ Field.d = function decorateField(fieldId, fieldType, fieldRule, defaultValue) {
     };
 };
 
+// Sets up cyclic dependencies (called in index-light)
+Field._configure = function configure(Type_) {
+    Type = Type_;
+};
+
 /**
  * Field decorator (TypeScript).
  * @name Field.d
@@ -365,10 +505,6 @@ Field.d = function decorateField(fieldId, fieldType, fieldRule, defaultValue) {
  * @returns {FieldDecorator} Decorator function
  * @template T extends Message<T>
  * @variation 2
+ * @deprecated Legacy TypeScript decorator support. Will be removed in a future release.
  */
 // like Field.d but without a default value
-
-// Sets up cyclic dependencies (called in index-light)
-Field._configure = function configure(Type_) {
-    Type = Type_;
-};

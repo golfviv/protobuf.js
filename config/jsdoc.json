@@ -4,22 +4,14 @@
     },
     "source": {
         "include": [
-            "./src/",
-            "./lib/aspromise/index.js",
-            "./lib/base64/index.js",
-            "./lib/codegen/index.js",
-            "./lib/eventemitter/index.js",
-            "./lib/fetch/index.js",
-            "./lib/inquire/index.js",
-            "./lib/path/index.js",
-            "./lib/pool/index.js",
-            "./lib/utf8/index.js"
+            "./src/"
         ],
         "exclude": [],
         "includePattern": ".+\\.js(doc)?$",
         "excludePattern": "(^|\\/|\\\\)_"
     },
     "plugins": [
+        "./cli/lib/tsd-jsdoc/patch",
         "./node_modules/jsdoc/plugins/markdown"
     ],
     "templates": {
@@ -29,7 +21,10 @@
             "outputSourceFiles" : false
         },
         "applicationName": "protobuf.js",
-        "googleAnalytics": "UA-40277577-3",
+        "applicationSubtitle": "API documentation",
+        "meta": {
+            "title": "protobuf.js API documentation"
+        },
         "linenums"      : true
     },
     "markdown"  : {
@@ -43,8 +38,9 @@
         "private"       : false,
         "lenient"       : false,
         "destination"   : "./docs",
-        "template"      : "./node_modules/jaguarjs-jsdoc",
-        "sourceRoot"    : "https://github.com/dcodeIO/protobuf.js/blob/master/src/",
-        "repo"          : "https://github.com/dcodeIO/protobuf.js"
+        "template"      : "./lib/jsdoc-template",
+        "sourceRoot"    : "https://github.com/protobufjs/protobuf.js/blob/master/src/",
+        "repo"          : "https://github.com/protobufjs/protobuf.js",
+        "repoBranch"    : "master"
     }
 }

@@ -1,29 +1,39 @@
 "use strict";
+/* global globalThis */
 var util = exports;
 
 // used to return a Promise where callback is omitted
-util.asPromise = require("@protobufjs/aspromise");
+util.asPromise = require("./aspromise");
 
 // converts to / from base64 encoded strings
-util.base64 = require("@protobufjs/base64");
+util.base64 = require("./base64");
 
 // base class of rpc.Service
-util.EventEmitter = require("@protobufjs/eventemitter");
+util.EventEmitter = require("./eventemitter");
 
 // float handling accross browsers
-util.float = require("@protobufjs/float");
-
-// requires modules optionally and hides the call from bundlers
-util.inquire = require("@protobufjs/inquire");
+util.float = require("./float");
 
 // converts to / from utf8 encoded strings
-util.utf8 = require("@protobufjs/utf8");
+util.utf8 = require("./utf8");
 
 // provides a node-like buffer pool in the browser
-util.pool = require("@protobufjs/pool");
+util.pool = require("./pool");
 
 // utility to work with the low and high bits of a 64 bit value
 util.LongBits = require("./longbits");
+
+/**
+ * Tests if the specified key can affect object prototypes.
+ * @memberof util
+ * @param {string} key Key to test
+ * @returns {boolean} `true` if the key is unsafe
+ */
+function isUnsafeProperty(key) {
+    return key === "__proto__" || key === "prototype" || key === "constructor";
+}
+
+util.isUnsafeProperty = isUnsafeProperty;
 
 /**
  * Whether running within node or not.
@@ -44,6 +54,7 @@ util.isNode = Boolean(typeof global !== "undefined"
 util.global = util.isNode && global
            || typeof window !== "undefined" && window
            || typeof self   !== "undefined" && self
+           || typeof globalThis !== "undefined" && globalThis
            || this; // eslint-disable-line no-invalid-this
 
 /**
@@ -107,7 +118,7 @@ util.isset =
  */
 util.isSet = function isSet(obj, prop) {
     var value = obj[prop];
-    if (value != null && obj.hasOwnProperty(prop)) // eslint-disable-line eqeqeq, no-prototype-builtins
+    if (value != null && Object.hasOwnProperty.call(obj, prop)) // eslint-disable-line eqeqeq
         return typeof value !== "object" || (Array.isArray(value) ? value.length : Object.keys(value).length) > 0;
     return false;
 };
@@ -125,20 +136,14 @@ util.isSet = function isSet(obj, prop) {
  */
 util.Buffer = (function() {
     try {
-        var Buffer = util.inquire("buffer").Buffer;
-        // refuse to use non-node buffers if not explicitly assigned (perf reasons):
-        return Buffer.prototype.utf8Write ? Buffer : /* istanbul ignore next */ null;
+        var Buffer = util.global.Buffer;
+        // refuse to use non-node buffers if not explicitly assigned (perf reasons)
+        return Buffer.prototype.utf8Write || util.isNode ? Buffer : /* istanbul ignore next */ null;
     } catch (e) {
         /* istanbul ignore next */
         return null;
     }
 })();
-
-// Internal alias of or polyfull for Buffer.from.
-util._Buffer_from = null;
-
-// Internal alias of or polyfill for Buffer.allocUnsafe.
-util._Buffer_allocUnsafe = null;
 
 /**
  * Creates a new buffer of whatever type supported by the environment.
@@ -146,23 +151,45 @@ util._Buffer_allocUnsafe = null;
  * @returns {Uint8Array|Buffer} Buffer
  */
 util.newBuffer = function newBuffer(sizeOrArray) {
+    var Buffer = util.Buffer;
     /* istanbul ignore next */
     return typeof sizeOrArray === "number"
-        ? util.Buffer
-            ? util._Buffer_allocUnsafe(sizeOrArray)
-            : new util.Array(sizeOrArray)
-        : util.Buffer
-            ? util._Buffer_from(sizeOrArray)
-            : typeof Uint8Array === "undefined"
-                ? sizeOrArray
-                : new Uint8Array(sizeOrArray);
+        ? Buffer
+            ? Buffer.allocUnsafe(sizeOrArray)
+            : new Uint8Array(sizeOrArray)
+        : Buffer
+            ? Buffer.from(sizeOrArray)
+            : new Uint8Array(sizeOrArray);
 };
 
 /**
- * Array implementation used in the browser. `Uint8Array` if supported, otherwise `Array`.
- * @type {Constructor<Uint8Array>}
+ * Prepends a raw field tag to raw field data.
+ * @param {number} id Field id
+ * @param {number} wireType Wire type
+ * @param {Uint8Array} data Raw field data
+ * @returns {Uint8Array|Buffer} Raw field bytes
+ * @ignore
  */
-util.Array = typeof Uint8Array !== "undefined" ? Uint8Array /* istanbul ignore next */ : Array;
+util.rawField = function rawField(id, wireType, data) {
+    var out = [],
+        tag = id << 3 | wireType;
+    tag >>>= 0;
+    while (tag > 127) {
+        out.push(tag & 127 | 128);
+        tag >>>= 7;
+    }
+    out.push(tag);
+    for (var i = 0; i < data.length; ++i)
+        out.push(data[i]);
+    return util.newBuffer(out);
+};
+
+/**
+ * Array implementation used in the browser.
+ * @type {Constructor<Uint8Array>}
+ * @deprecated Use `Uint8Array` instead.
+ */
+util.Array = Uint8Array;
 
 /**
  * Any compatible Long instance.
@@ -179,14 +206,22 @@ util.Array = typeof Uint8Array !== "undefined" ? Uint8Array /* istanbul ignore n
  */
 util.Long = /* istanbul ignore next */ util.global.dcodeIO && /* istanbul ignore next */ util.global.dcodeIO.Long
          || /* istanbul ignore next */ util.global.Long
-         || util.inquire("long");
+         || (function() {
+                try {
+                    var Long = require("long");
+                    return Long && Long.isLong ? Long : null;
+                } catch (e) {
+                    /* istanbul ignore next */
+                    return null;
+                }
+            })();
 
 /**
  * Regular expression used to verify 2 bit (`bool`) map keys.
  * @type {RegExp}
  * @const
  */
-util.key2Re = /^true|false|0|1$/;
+util.key2Re = /^(?:true|false|0|1)$/;
 
 /**
  * Regular expression used to verify 32 bit (`int32` etc.) map keys.
@@ -200,7 +235,7 @@ util.key32Re = /^-?(?:0|[1-9][0-9]*)$/;
  * @type {RegExp}
  * @const
  */
-util.key64Re = /^(?:[\\x00-\\xff]{8}|-?(?:0|[1-9][0-9]*))$/;
+util.key64Re = /^(?:[\x00-\xff]{8}|-?(?:0|[1-9][0-9]*))$/; // eslint-disable-line no-control-regex
 
 /**
  * Converts a number or long to an 8 characters long hash string.
@@ -227,21 +262,81 @@ util.longFromHash = function longFromHash(hash, unsigned) {
 };
 
 /**
+ * Converts a 64 bit key to a long or number if it is an 8 characters long hash string.
+ * @param {string} key Map key
+ * @param {boolean} [unsigned=false] Whether unsigned or not
+ * @returns {Long|number|string} Original value
+ */
+util.longFromKey = function longFromKey(key, unsigned) {
+    return util.key64Re.test(key) && !util.key32Re.test(key)
+        ? util.longFromHash(key, unsigned)
+        : key;
+};
+
+/**
+ * Converts a boolean key to a boolean value.
+ * @param {string} key Map key
+ * @returns {boolean} Boolean value
+ */
+util.boolFromKey = function boolFromKey(key) {
+    return key === "true" || key === "1";
+};
+
+/**
  * Merges the properties of the source object into the destination object.
  * @memberof util
  * @param {Object.<string,*>} dst Destination object
- * @param {Object.<string,*>} src Source object
- * @param {boolean} [ifNotSet=false] Merges only if the key is not already set
+ * @param {...(Object.<string,*>|boolean)} src Source objects, optionally followed by an `ifNotSet` flag
  * @returns {Object.<string,*>} Destination object
  */
-function merge(dst, src, ifNotSet) { // used by converters
-    for (var keys = Object.keys(src), i = 0; i < keys.length; ++i)
-        if (dst[keys[i]] === undefined || !ifNotSet)
-            dst[keys[i]] = src[keys[i]];
+function merge(dst) { // used by converters
+    var ifNotSet = typeof arguments[arguments.length - 1] === "boolean",
+        limit = ifNotSet ? arguments.length - 1 : arguments.length;
+    ifNotSet = ifNotSet && arguments[arguments.length - 1];
+    for (var a = 1; a < limit; ++a) {
+        var src = arguments[a];
+        if (!src)
+            continue;
+        for (var keys = Object.keys(src), i = 0; i < keys.length; ++i)
+            if (!isUnsafeProperty(keys[i]) && (!ifNotSet || !Object.prototype.hasOwnProperty.call(dst, keys[i]) || dst[keys[i]] === undefined))
+                dst[keys[i]] = src[keys[i]];
+    }
     return dst;
 }
 
 util.merge = merge;
+
+/**
+ * Schema declaration nesting limit.
+ * @memberof util
+ * @type {number}
+ */
+util.nestingLimit = 32; // protoc: MaxMessageDeclarationNestingDepth
+
+/**
+ * Recursion limit.
+ * @memberof util
+ * @type {number}
+ */
+util.recursionLimit = 100; // protoc: CodedInputStream::default_recursion_limit_
+
+/**
+ * Makes a property safe for assignment as an own property.
+ * @memberof util
+ * @param {Object.<string,*>} obj Object
+ * @param {string} key Property key
+ * @param {boolean} [enumerable=true] Whether the property should be enumerable
+ * @returns {undefined}
+ */
+util.makeProp = function makeProp(obj, key, enumerable) {
+    if (Object.prototype.hasOwnProperty.call(obj, key))
+        return;
+    Object.defineProperty(obj, key, {
+        enumerable: enumerable === undefined ? true : enumerable,
+        configurable: true,
+        writable: true
+    });
+};
 
 /**
  * Converts the first character of a string to lower case.
@@ -280,13 +375,30 @@ function newError(name) {
             merge(this, properties);
     }
 
-    (CustomError.prototype = Object.create(Error.prototype)).constructor = CustomError;
-
-    Object.defineProperty(CustomError.prototype, "name", { get: function() { return name; } });
-
-    CustomError.prototype.toString = function toString() {
-        return this.name + ": " + this.message;
-    };
+    CustomError.prototype = Object.create(Error.prototype, {
+        constructor: {
+            value: CustomError,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+        name: {
+            get: function get() { return name; },
+            set: undefined,
+            enumerable: false,
+            // configurable: false would accurately preserve the behavior of
+            // the original, but I'm guessing that was not intentional.
+            // For an actual error subclass, this property would
+            // be configurable.
+            configurable: true,
+        },
+        toString: {
+            value: function value() { return this.name + ": " + this.message; },
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
+    });
 
     return CustomError;
 }
@@ -396,26 +508,4 @@ util.toJSONOptions = {
     enums: String,
     bytes: String,
     json: true
-};
-
-// Sets up buffer utility according to the environment (called in index-minimal)
-util._configure = function() {
-    var Buffer = util.Buffer;
-    /* istanbul ignore if */
-    if (!Buffer) {
-        util._Buffer_from = util._Buffer_allocUnsafe = null;
-        return;
-    }
-    // because node 4.x buffers are incompatible & immutable
-    // see: https://github.com/dcodeIO/protobuf.js/pull/665
-    util._Buffer_from = Buffer.from !== Uint8Array.from && Buffer.from ||
-        /* istanbul ignore next */
-        function Buffer_from(value, encoding) {
-            return new Buffer(value, encoding);
-        };
-    util._Buffer_allocUnsafe = Buffer.allocUnsafe ||
-        /* istanbul ignore next */
-        function Buffer_allocUnsafe(size) {
-            return new Buffer(size);
-        };
 };

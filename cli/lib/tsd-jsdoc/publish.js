@@ -2,7 +2,7 @@
 
 var fs = require("fs");
 
-// output stream
+// output chunks
 var out = null;
 
 // documentation data
@@ -19,9 +19,6 @@ var indentWritten = false;
 
 // provided options
 var options = {};
-
-// queued interfaces
-var queuedInterfaces = [];
 
 // whether writing the first line
 var firstLine = true;
@@ -56,13 +53,9 @@ exports.publish = function publish(taffy, opts) {
     if (!options.private)
         taffy({ access: "private" }).remove();
 
-    // setup output
-    out = options.destination
-        ? fs.createWriteStream(options.destination)
-        : process.stdout;
-
     try {
         // setup environment
+        out = [];
         data = taffy().get();
         indent = 0;
         indentWritten = false;
@@ -82,29 +75,29 @@ exports.publish = function publish(taffy, opts) {
             handleElement(child, null);
         });
 
-        // process queued
-        while (queuedInterfaces.length) {
-            var element = queuedInterfaces.shift();
-            begin(element);
-            writeInterface(element);
-            writeln(";");
-        }
-
         // end wrap
         if (options.module) {
             --indent;
             writeln("}");
         }
 
-        // close file output
-        if (out !== process.stdout)
-            out.end();
+        // Let JSDoc wait for output to flush before exiting
+        return new Promise(function(resolve, reject) {
+            function done(err) {
+                if (err)
+                    reject(err);
+                else
+                    resolve();
+            }
+            // Use stdout fd 1 directly because uv_guess_handle can fail to classify
+            // sandboxed stdout handles when getsockname/getsockopt raises EPERM.
+            fs.writeFile(options.destination || 1, out.join(""), "utf8", done);
+        });
 
     } finally {
         // gc environment objects
         out = data = null;
         seen = options = {};
-        queuedInterfaces = [];
     }
 };
 
@@ -114,13 +107,22 @@ exports.publish = function publish(taffy, opts) {
 
 // writes one or multiple strings
 function write() {
-    var s = Array.prototype.slice.call(arguments).join("");
-    if (!indentWritten) {
-        for (var i = 0; i < indent; ++i)
-            s = "    " + s;
-        indentWritten = true;
+    var lines = Array.prototype.slice.call(arguments).join("").replace(/\r?\n|\r/g, "\n").split("\n");
+    for (var i = 0; i < lines.length; ++i) {
+        var s = lines[i];
+        if (i) {
+            out.push("\n");
+            indentWritten = false;
+        }
+        if (s.length) {
+            if (!indentWritten) {
+                for (var j = 0; j < indent; ++j)
+                    s = "    " + s;
+                indentWritten = true;
+            }
+            out.push(s);
+        }
     }
-    out.write(s);
     firstLine = false;
 }
 
@@ -130,7 +132,7 @@ function writeln() {
     if (s.length)
         write(s, "\n");
     else if (!firstLine)
-        out.write("\n");
+        out.push("\n");
     indentWritten = false;
 }
 
@@ -138,7 +140,8 @@ var keepTags = [
     "param",
     "returns",
     "throws",
-    "see"
+    "see",
+    "deprecated"
 ];
 
 // parses a comment into text and tags
@@ -207,6 +210,8 @@ function writeComment(comment, otherwiseNewline) {
                 }
                 writeln(line);
             });
+        } else if (tag.name === "deprecated") {
+            writeln(" * @deprecated");
         }
     });
     writeln(" */");
@@ -273,33 +278,132 @@ function getTypeOf(element) {
     // Replace catchalls with any
     name = name.replace(/\*|\bmixed\b/g, "any");
 
-    // Ensure upper case Object for map expressions below
-    name = name.replace(/\bobject\b/g, "Object");
+    // Convert innermost generic types first so Array.<Object.<...>>
+    // and Object.<string,Array.<...>> are both handled correctly
+    var prevName;
+    do {
+        prevName = name;
+        name = name.replace(/\bObject\.?<([^,<>]*), *([^<>]*)>/gi, function($0, $1, $2) {
+            return "{ [k: " + $1 + "]: " + $2 + " }";
+        });
+        name = name.replace(/\bArray\.?<([^<>]*)>/gi, function($0, $1) {
+            var elementType = $1.trim();
+            if (splitTypeList(elementType, "|").length > 1 || splitTypeList(elementType, "&").length > 1)
+                elementType = "(" + elementType + ")";
+            return elementType + "[]";
+        });
+        name = name.replace(/\b(?!Object|Array)([\w$]+)\.<([^<>]*)>/gi, function($0, $1, $2) {
+            return $1 + "<" + $2 + ">";
+        });
+    } while (name !== prevName);
 
     // Correct Something.<Something> to Something<Something>
     name = replaceRecursive(name, /\b(?!Object|Array)([\w$]+)\.<([^>]*)>/gi, function($0, $1, $2) {
         return $1 + "<" + $2 + ">";
     });
 
-    // Replace Array.<string> with string[]
-    name = replaceRecursive(name, /\bArray\.?<([^>]*)>/gi, function($0, $1) {
-        return $1 + "[]";
-    });
-
-    // Replace Object.<string,number> with { [k: string]: number }
-    name = replaceRecursive(name, /\bObject\.?<([^,]*), *([^>]*)>/gi, function($0, $1, $2) {
-        return "{ [k: " + $1 + "]: " + $2 + " }";
-    });
-
     // Replace functions (there are no signatures) with Function
     name = name.replace(/\bfunction(?:\(\))?\b/g, "Function");
 
-    // Convert plain Object back to just object
-    name = name.replace(/\b(Object\b(?!\.))/g, function($0, $1) {
-        return $1.toLowerCase();
+    // Convert plain Object back to just object, but preserve qualified names like foo.Object
+    name = name.replace(/(^|[^\w$.])Object\b(?![.<])/g, function($0, prefix) {
+        return prefix + "object";
     });
 
     return name;
+}
+
+function splitTypeList(text, delimiter) {
+    var parts = [];
+    var start = 0;
+    var depth = {
+        brace: 0,
+        bracket: 0,
+        paren: 0,
+        angle: 0
+    };
+    var quote = null;
+    for (var i = 0; i < text.length; ++i) {
+        var ch = text.charAt(i);
+        if (quote) {
+            if (ch === "\\")
+                ++i;
+            else if (ch === quote)
+                quote = null;
+            continue;
+        }
+        if (ch === "\"" || ch === "'") {
+            quote = ch;
+            continue;
+        }
+        switch (ch) {
+            case "{": ++depth.brace; break;
+            case "}": --depth.brace; break;
+            case "[": ++depth.bracket; break;
+            case "]": --depth.bracket; break;
+            case "(": ++depth.paren; break;
+            case ")": --depth.paren; break;
+            case "<": ++depth.angle; break;
+            case ">":
+                if (depth.angle > 0)
+                    --depth.angle;
+                break;
+            default:
+                if (ch === delimiter && !depth.brace && !depth.bracket && !depth.paren && !depth.angle) {
+                    parts.push(text.substring(start, i).trim());
+                    start = i + 1;
+                }
+                break;
+        }
+    }
+    parts.push(text.substring(start).trim());
+    return parts.filter(function(part) {
+        return part.length;
+    });
+}
+
+function getCallSignatures(type) {
+    type = type && type.trim();
+    if (!type || type.charAt(0) !== "{" || type.charAt(type.length - 1) !== "}")
+        return null;
+    var body = type.substring(1, type.length - 1).trim();
+    if (body.charAt(0) !== "(")
+        return null;
+    var signatures = splitTypeList(body, ";");
+    if (!signatures.every(function(signature) {
+        return getCallSignatureParametersEnd(signature) > 0;
+    }))
+        return null;
+    return signatures.map(function(signature) {
+        return /;\s*$/.test(signature) ? signature : signature + ";";
+    });
+}
+
+function getCallSignatureParametersEnd(signature) {
+    var depth = 0;
+    var quote = null;
+    for (var i = 0; i < signature.length; ++i) {
+        var ch = signature.charAt(i);
+        if (quote) {
+            if (ch === "\\")
+                ++i;
+            else if (ch === quote)
+                quote = null;
+            continue;
+        }
+        if (ch === "\"" || ch === "'") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "(")
+            ++depth;
+        else if (ch === ")" && --depth === 0) {
+            while (++i < signature.length && /\s/.test(signature.charAt(i)))
+                continue;
+            return signature.charAt(i) === ":" ? i : -1;
+        }
+    }
+    return -1;
 }
 
 // begins writing the definition of the specified element
@@ -372,7 +476,9 @@ function writeFunctionSignature(element, isConstructor, isTypeDef) {
     if (!isConstructor) {
         write(isTypeDef ? " => " : ": ");
         var typeName;
-        if (element.returns && element.returns.length && (typeName = getTypeOf(element.returns[0])) !== "undefined")
+        if (element.tsType)
+            write(element.tsType.replace(/\r?\n|\r/g, "\n"));
+        else if (element.returns && element.returns.length && (typeName = getTypeOf(element.returns[0])) !== "undefined")
             write(typeName);
         else
             write("void");
@@ -381,7 +487,7 @@ function writeFunctionSignature(element, isConstructor, isTypeDef) {
 
 // writes (a typedef as) an interface
 function writeInterface(element) {
-    write("interface ", element.name);
+    write("interface ", element.name, " ");
     writeInterfaceBody(element);
     writeln();
 }
@@ -392,19 +498,26 @@ function writeInterfaceBody(element) {
     if (element.tsType)
         writeln(element.tsType.replace(/\r?\n|\r/g, "\n"));
     else if (element.properties && element.properties.length)
-        element.properties.forEach(writeProperty);
+        element.properties.forEach((property) => writeProperty(property));
     --indent;
     write("}");
 }
 
-function writeProperty(property, declare) {
+function writeProperty(property, declare, inClass) {
     writeComment(property.description);
-    if (declare)
+    if (declare && !inClass)
         write("let ");
     write(property.name);
     if (property.optional)
         write("?");
     writeln(": ", getTypeOf(property), ";");
+}
+
+function isDefaultExport(element) {
+    return element.name === "default"
+        && element.meta
+        && element.meta.code
+        && element.meta.code.name === "exports.default";
 }
 
 //
@@ -438,7 +551,7 @@ function handleElement(element, parent) {
                 handleEnum(element, parent);
                 break;
             }
-            // eslint-disable-line no-fallthrough
+            // eslint-disable-next-line no-fallthrough
         case "namespace":
             handleNamespace(element, parent);
             break;
@@ -539,13 +652,18 @@ function handleClass(element, parent) {
         writeln(element.tsType.replace(/\r?\n|\r/g, "\n"));
 
     // constructor
-    if (!is_interface && !element.virtual)
-        handleFunction(element, parent, true);
+    if (!is_interface && !element.virtual) {
+        if (options.constructor === false) {
+            writeComment("Reflection-backed declarations are not constructable. Use " + element.name + ".create(...) instead.");
+            writeln("private constructor();");
+        } else
+            handleFunction(element, parent, true);
+    }
 
     // properties
-    if (is_interface && element.properties)
+    if (element.properties)
         element.properties.forEach(function(property) {
-            writeProperty(property);
+            writeProperty(property, false, !is_interface);
         });
 
     // class-compatible members
@@ -598,6 +716,7 @@ function handleEnum(element) {
         writeln("enum ", element.name, " {");
         ++indent;
         element.properties.forEach(function(property, i) {
+            writeComment(property.description);
             write(property.name);
             if (property.defaultvalue !== undefined)
                 write(" = ", JSON.stringify(property.defaultvalue));
@@ -617,11 +736,18 @@ function handleMember(element, parent) {
         handleEnum(element);
         return;
     }
+    if (!parent && isDefaultExport(element)) {
+        writeComment(element.comment, true);
+        writeln("declare const _default: ", getTypeOf(element), ";");
+        writeln("export default _default;");
+        return;
+    }
     begin(element);
 
     var inClass = isClassLike(parent);
     if (inClass) {
-        write(element.access || "public", " ");
+        if (element.access && element.access !== "public")
+            write(element.access, " ");
         if (element.scope === "static")
             write("static ");
         if (element.readonly)
@@ -646,6 +772,24 @@ function handleMember(element, parent) {
         writeln(getTypeOf(element), ";");
 }
 
+function writeFunctionName(element, insideClass, exported) {
+    if (insideClass) {
+        if (element.access && element.access !== "public")
+            write(element.access, " ");
+        if (element.scope === "static")
+            write("static ");
+        else if (element.virtual)
+            write("abstract ");
+    } else {
+        if (exported)
+            write("export ");
+        write("function ");
+    }
+    write(element.name);
+    if (element.templates && element.templates.length)
+        write("<", element.templates.join(", "), ">");
+}
+
 // handles a function or method
 function handleFunction(element, parent, isConstructor) {
     var insideClass = true;
@@ -655,15 +799,21 @@ function handleFunction(element, parent, isConstructor) {
     } else {
         begin(element);
         insideClass = isClassLike(parent);
-        if (insideClass) {
-            write(element.access || "public", " ");
-            if (element.scope === "static")
-                write("static ");
-        } else
-            write("function ");
-        write(element.name);
-        if (element.templates && element.templates.length)
-            write("<", element.templates.join(", "), ">");
+        writeFunctionName(element, insideClass);
+    }
+    var signatures = null;
+    if (element.type && element.type.names && element.type.names.length === 1)
+        signatures = getCallSignatures(element.type.names[0]);
+    if (signatures) {
+        writeln(signatures[0]);
+        var exported = !insideClass && (element.scope === "global" || element.isEnum && element.scope === undefined) && !options.module;
+        for (var i = 1; i < signatures.length; ++i) {
+            writeFunctionName(element, insideClass, exported);
+            writeln(signatures[i]);
+        }
+        if (!insideClass)
+            handleNamespace(element);
+        return;
     }
     writeFunctionSignature(element, isConstructor, false);
     writeln(";");
@@ -673,15 +823,30 @@ function handleFunction(element, parent, isConstructor) {
 
 // handles a type definition (not a real type)
 function handleTypeDef(element, parent) {
-    if (isInterface(element)) {
-        if (isClassLike(parent))
-            queuedInterfaces.push(element);
-        else {
-            begin(element);
-            writeInterface(element);
-        }
+    var suffix = "." + element.name;
+    var owner = element.longname && element.longname !== element.name && element.longname.lastIndexOf(suffix) === element.longname.length - suffix.length
+        ? element.longname.substring(0, element.longname.length - suffix.length)
+        : null;
+
+    // Emit nested typedefs like Foo.Bar as declarations in namespace Foo
+    if (owner && (!parent || parent.longname !== owner)) {
+        if (element.scope === "global" && !options.module)
+            write("export ");
+        writeln("namespace ", owner, " {");
+        ++indent;
+        handleTypeDef(element, { longname: owner });
+        --indent;
+        writeln("}");
+        return;
+    }
+
+    // Emit object typedefs with properties as interfaces, any others as type aliases
+    var type = getTypeOf(element);
+    if (isInterface(element) || type === "object" && element.properties && element.properties.length) {
+        begin(element);
+        writeInterface(element);
     } else {
-        writeComment(element.comment, true);
+        begin(element);
         write("type ", element.name);
         if (element.templates && element.templates.length)
             write("<", element.templates.join(", "), ">");
@@ -689,9 +854,20 @@ function handleTypeDef(element, parent) {
         if (element.tsType)
             write(element.tsType.replace(/\r?\n|\r/g, "\n"));
         else {
-            var type = getTypeOf(element);
-            if (element.type && element.type.names.length === 1 && element.type.names[0] === "function")
-                writeFunctionSignature(element, false, true);
+            if (element.type && element.type.names.length === 1 && element.type.names[0] === "function") {
+                if (element.properties && element.properties.length) {
+                    writeln("{");
+                    ++indent;
+                    writeFunctionSignature(element, false, false);
+                    writeln(";");
+                    element.properties.forEach(function(property) {
+                        writeProperty(property);
+                    });
+                    --indent;
+                    write("}");
+                } else
+                    writeFunctionSignature(element, false, true);
+            }
             else if (type === "object") {
                 if (element.properties && element.properties.length)
                     writeInterfaceBody(element);

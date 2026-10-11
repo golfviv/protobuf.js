@@ -3,38 +3,66 @@ on:
     branches:
       - master
 name: release-please
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
 jobs:
-  release-please-pr:
+  release-please:
     runs-on: ubuntu-latest
     steps:
-      - id: release-pr
-        uses: GoogleCloudPlatform/release-please-action@v2
+      - uses: googleapis/release-please-action@v5
+        id: release
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release-type: node
-          package-name: protobufjs
-          command: release-pr
-  release-please-release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: GoogleCloudPlatform/release-please-action@v2
-        id: tag-release
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - uses: actions/checkout@v7
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release-type: node
-          package-name: protobufjs
-          command: github-release
-      - uses: actions/checkout@v2
-        if: ${{ steps.tag-release.outputs.release_created }}
-      - uses: actions/setup-node@v1
-        if: ${{ steps.tag-release.outputs.release_created }}
+          submodules: true
+
+      - uses: actions/setup-node@v7
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
         with:
-          node-version: 14
-          registry-url: 'https://wombat-dressing-room.appspot.com/'
-      - name: publish
-        if: ${{ steps.tag-release.outputs.release_created }}
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Use npm with trusted publishing support
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        run: npm install -g npm@^11.5.1
+
+      - name: Install dependencies
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        run: npm install --ignore-scripts
+
+      - name: Install CLI dependencies
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        run: npm --prefix cli install --ignore-scripts
+
+      - name: Build
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        run: npm run build
+
+      - name: Test
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        run: npm test
+
+      - name: Publish protobufjs
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: npm publish --ignore-scripts
+
+      - name: Publish protobufjs-cli
+        if: ${{ steps.release.outputs['cli--release_created'] == 'true' }}
+        working-directory: cli
+        run: npm publish --ignore-scripts
+
+      - name: Publish API docs
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        continue-on-error: true
         env:
-          NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
-        run: |
-          npm install
-          npm publish
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run docs:publish

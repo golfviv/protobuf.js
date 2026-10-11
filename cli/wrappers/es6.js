@@ -1,5 +1,7 @@
-import * as $protobuf from $DEPENDENCY;
+import $protobuf from $DEPENDENCY;
 
 $OUTPUT;
 
-export { $root as default };
+export {
+  $DEFAULT_EXPORT$root as default
+};

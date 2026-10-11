@@ -1,0 +1,21 @@
+{
+  "name": "@protobufjs/bench",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "generate": "node generate.js",
+    "bench": "node --max-semi-space-size=256 --max-old-space-size=1024 index.js --save",
+    "render": "node report.js"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.16.0",
+    "benchmark": "^2.1.4",
+    "google-protobuf": "4.0.2"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.16.0",
+    "@protocolbuffers/protoc-gen-js": "4.0.3",
+    "protoc": "^35.1.0"
+  }
+}

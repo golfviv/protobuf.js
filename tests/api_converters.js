@@ -2,6 +2,33 @@ var tape = require("tape");
 
 var protobuf  = require("..");
 
+tape.test("converters - special floating-point defaults", function(test) {
+    var Type = protobuf.parse("syntax = \"proto2\";\
+        message NonFiniteDefaults {\
+            optional double positive = 1 [default = inf];\
+            optional double negative = 2 [default = -inf];\
+            optional float not_a_number = 3 [default = nan];\
+            optional double negative_zero = 4 [default = -0];\
+            optional double finite = 5 [default = 1.5];\
+        }").root.lookupType("NonFiniteDefaults"),
+        message = Type.create();
+
+    var object = Type.toObject(message, { defaults: true });
+    test.equal(object.positive, Infinity, "should preserve a positive infinity default");
+    test.equal(object.negative, -Infinity, "should preserve a negative infinity default");
+    test.ok(Number.isNaN(object.notANumber), "should preserve a NaN default");
+    test.ok(Object.is(object.negativeZero, -0), "should preserve a negative zero default");
+    test.equal(object.finite, 1.5, "should preserve a finite default");
+
+    var jsonObject = Type.toObject(message, { defaults: true, json: true });
+    test.equal(jsonObject.positive, "Infinity", "should JSON-convert a positive infinity default");
+    test.equal(jsonObject.negative, "-Infinity", "should JSON-convert a negative infinity default");
+    test.equal(jsonObject.notANumber, "NaN", "should JSON-convert a NaN default");
+    test.ok(Object.is(jsonObject.negativeZero, -0), "should preserve a negative zero default in JSON mode");
+
+    test.end();
+});
+
 tape.test("converters", function(test) {
 
     protobuf.load("tests/data/convert.proto", function(err, root) {
@@ -12,7 +39,7 @@ tape.test("converters", function(test) {
 
         test.test(test.name + " - Message#toObject", function(test) {
 
-            test.plan(6);
+            test.plan(8);
 
             test.test(test.name + " - called with defaults = true", function(test) {
                 var obj = Message.toObject(Message.create(), { defaults: true });
@@ -30,6 +57,14 @@ tape.test("converters", function(test) {
                 test.same(obj.enumRepeated, [], "should set enumRepeated");
 
                 test.same(obj.int64Map, {}, "should set int64Map");
+
+                test.end();
+            });
+
+            test.test(test.name + " - called with defaults = true and longs = BigInt", function(test) {
+                var obj = Message.toObject(Message.create(), { defaults: true, longs: BigInt });
+
+                test.equal(obj.uint64Val, 0n, "should set uint64Val");
 
                 test.end();
             });
@@ -98,28 +133,35 @@ tape.test("converters", function(test) {
                 var buf = protobuf.util.newBuffer(3);
                 buf[0] = buf[1] = buf[2] = 49; // "111"
                 var msg = Message.create({
-                    uint64Val: protobuf.util.Long.fromNumber(1),
+                    // This number was chosen to be > 2^63 and < 2^64.
+                    uint64Val: protobuf.util.Long.fromString("11000000000000000001", true),
                     uint64Repeated: [2, 3],
                     bytesVal: buf,
                     bytesRepeated: [buf, buf],
                     enumVal: 2,
-                    enumRepeated: [1, 2],
+                    enumRepeated: [1, 100, 2],
                     int64Map: {
-                        a: protobuf.util.Long.fromNumber(2),
-                        b: protobuf.util.Long.fromNumber(3)
+                        // These numbers were chosen to be < Number.MIN_SAFE_INTEGER.
+                        a: protobuf.util.Long.fromString("-200000000000000001"),
+                        b: protobuf.util.Long.fromString("-300000000000000001")
                     }
                 });
 
                 var msgLongsToNumber = Message.toObject(msg, { longs: Number }),
-                    msgLongsToString = Message.toObject(msg, { longs: String });
+                    msgLongsToString = Message.toObject(msg, { longs: String }),
+                    msgLongsToBigInt = Message.toObject(msg, { longs: BigInt });
 
                 test.same(Message.ctor.toObject(msg, { longs: Number}), msgLongsToNumber, "should convert the same using the static and the instance method");
                 test.same(Message.ctor.toObject(msg, { longs: String}), msgLongsToString, "should convert the same using the static and the instance method");
+                test.same(Message.ctor.toObject(msg, { longs: BigInt}), msgLongsToBigInt, "should convert the same using the static and the instance method");
 
-                test.equal(msgLongsToNumber.uint64Val, 1, "longs to numbers");
-                test.equal(msgLongsToString.uint64Val, "1", "longs to strings");
-                test.same(msgLongsToNumber.int64Map, { a: 2, b: 3}, "long map values to numbers");
-                test.same(msgLongsToString.int64Map, { a: "2", b: "3"}, "long map values to strings");
+                test.equal(msgLongsToNumber.uint64Val, 11000000000000000000, "longs to numbers");
+                test.equal(msgLongsToString.uint64Val, "11000000000000000001", "longs to strings");
+                test.equal(msgLongsToBigInt.uint64Val, 11000000000000000001n, "longs to bigints");
+                test.same(msgLongsToBigInt.uint64Repeated, [2n, 3n], "long arrays to bigints");
+                test.same(msgLongsToNumber.int64Map, { a: -200000000000000000, b: -300000000000000000}, "long map values to numbers");
+                test.same(msgLongsToString.int64Map, { a: "-200000000000000001", b: "-300000000000000001"}, "long map values to strings");
+                test.same(msgLongsToBigInt.int64Map, { a: -200000000000000001n, b: -300000000000000001n}, "long map values to bigints");
 
                 test.equal(Object.prototype.toString.call(Message.toObject(msg, { bytes: Array }).bytesVal), "[object Array]", "bytes to arrays");
                 test.equal(Message.toObject(msg, { bytes: String }).bytesVal, "MTEx", "bytes to base64 strings");
@@ -127,6 +169,7 @@ tape.test("converters", function(test) {
                     test.ok(Buffer.isBuffer(Message.toObject(msg, { bytes: Buffer }).bytesVal), "bytes to buffers");
 
                 test.equal(Message.toObject(msg, { enums: String }).enumVal, "TWO", "enums to strings");
+                test.equal(Message.toObject(msg, { enums: String }).enumRepeated[1], 100, "enums to strings does not change unknown values");
 
                 test.end();
             });
@@ -147,6 +190,63 @@ tape.test("converters", function(test) {
                 test.end();
             });            
 
+            test.test(test.name + " - Message.toObject with bytes array defaults", function(test) {
+                var root = protobuf.Root.fromJSON({
+                    nested: {
+                        Defaults: {
+                            fields: {
+                                bytes: {
+                                    type: "bytes",
+                                    id: 1,
+                                    options: {
+                                        "default": [ "not_a_number" ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                var Defaults = root.lookupType("Defaults");
+                var obj = Defaults.toObject({}, { defaults: true, bytes: Array });
+
+                test.same(obj.bytes, [ "not_a_number" ], "should preserve bytes array defaults");
+
+                test.end();
+            });
+
+        });
+
+        test.test(test.name + " - null-prototype objects", function(test) {
+            var userRoot = protobuf.parse("syntax = \"proto2\"; message User { optional string name = 1; optional int32 age = 2; }").root,
+                User = userRoot.lookupType("User"),
+                user = Object.create(null),
+                oneofRoot = protobuf.parse("syntax = \"proto3\"; message M { oneof kind { string a = 1; int32 b = 2; } }").root,
+                M = oneofRoot.lookupType("M"),
+                oneof = Object.create(null);
+
+            user.name = "attacker";
+            user.age = 99;
+            test.equal(User.verify(user), null, "verify accepts valid null-prototype objects");
+
+            user.age = "bad";
+            test.equal(User.verify(user), "age: integer expected", "verify returns errors for invalid null-prototype objects");
+
+            oneof.a = "x";
+            test.same(M.toObject(oneof, { oneofs: true }), { a: "x", kind: "a" }, "toObject converts null-prototype oneof objects");
+
+            test.end();
+        });
+
+        test.test(test.name + " - runtime-significant field names", function(test) {
+            var root = protobuf.parse("syntax = \"proto2\"; message M { required string hasOwnProperty = 1; }").root;
+            root.resolveAll();
+            var M = root.lookupType("M"),
+                message = M.decode(M.encode({ hasOwnProperty: "x" }).finish());
+
+            test.equal(message.hasOwnProperty, "x", "decode should not call a shadowed hasOwnProperty field");
+            test.equal(M.verify(message), null, "verify should not call a shadowed hasOwnProperty field");
+            test.same(M.toObject(message), { hasOwnProperty: "x" }, "toObject should not call a shadowed hasOwnProperty field");
+            test.end();
         });
 
         test.test(test.name + " - Message.fromObject", function(test) {
@@ -157,7 +257,7 @@ tape.test("converters", function(test) {
                 bytesVal: "MTEx",
                 bytesRepeated: ["MTEx", [49, 49, 49]],
                 enumVal: "ONE",
-                enumRepeated: [2, "TWO"],
+                enumRepeated: [2, "TWO", 100],
                 int64Map: {
                     a: 2,
                     b: "3"
@@ -176,8 +276,108 @@ tape.test("converters", function(test) {
             test.same(msg.bytesVal, buf, "should set bytesVal from a base64 string");
             test.same(msg.bytesRepeated, [ buf, buf ], "should set bytesRepeated from a base64 string and a plain array");
             test.equal(msg.enumVal, 1, "should set enumVal from a string");
-            test.same(msg.enumRepeated, [ 2, 2 ], "should set enumRepeated from a number and a string");
+            test.same(msg.enumRepeated, [ 2, 2, 100 ], "should set enumRepeated from a number and a string and preserve unknown value");
             test.same(msg.int64Map, { a: { low: 2, high: 0, unsigned: false }, b: { low: 3, high: 0, unsigned: false } }, "should set int64Map from a number and a string");
+
+            var bigMsg = Message.fromObject({
+                uint64Val: 11000000000000000001n,
+                uint64Repeated: [2n, 3n],
+                int64Map: {
+                    a: -200000000000000001n,
+                    b: -300000000000000001n
+                }
+            });
+
+            test.same(bigMsg.uint64Val, protobuf.util.Long.fromString("11000000000000000001", true), "should set uint64Val from a bigint");
+            test.same(bigMsg.uint64Repeated, [
+                protobuf.util.Long.fromString("2", true),
+                protobuf.util.Long.fromString("3", true)
+            ], "should set uint64Repeated from bigints");
+            test.same(bigMsg.int64Map, {
+                a: protobuf.util.Long.fromString("-200000000000000001"),
+                b: protobuf.util.Long.fromString("-300000000000000001")
+            }, "should set int64Map from bigints");
+
+            test.end();
+        });
+
+        test.test(test.name + " - fixed64 signedness", function(test) {
+            var root = protobuf.Root.fromJSON({
+                nested: {
+                    Fixed: {
+                        fields: {
+                            fixed64Val: {
+                                type: "fixed64",
+                                id: 1
+                            },
+                            sfixed64Val: {
+                                type: "sfixed64",
+                                id: 2
+                            }
+                        }
+                    }
+                }
+            });
+            var Fixed = root.lookupType("Fixed");
+            var msg = Fixed.fromObject({
+                fixed64Val: "11000000000000000001",
+                sfixed64Val: "-9000000000000000001"
+            });
+            var msgFromNumber = Fixed.fromObject({
+                fixed64Val: 11000000000000000000,
+                sfixed64Val: -9000000000000000000
+            });
+            var msgFromLongZero = Fixed.fromObject({
+                fixed64Val: protobuf.util.Long.ZERO,
+                sfixed64Val: protobuf.util.Long.UZERO
+            });
+            var obj = Fixed.toObject(msg, { longs: BigInt });
+            var defaults = Fixed.toObject(Fixed.create(), { defaults: true });
+
+            test.equal(msg.fixed64Val.unsigned, true, "should set fixed64 values as unsigned");
+            test.equal(msg.sfixed64Val.unsigned, false, "should set sfixed64 values as signed");
+            test.same(msgFromNumber.fixed64Val, protobuf.util.Long.fromString("11000000000000000000", true), "should set fixed64 values from numbers as unsigned");
+            test.same(msgFromNumber.sfixed64Val, protobuf.util.Long.fromString("-9000000000000000000"), "should set sfixed64 values from numbers as signed");
+            test.same(msgFromLongZero.fixed64Val, protobuf.util.Long.UZERO, "should set fixed64 values from Longs as unsigned");
+            test.same(msgFromLongZero.sfixed64Val, protobuf.util.Long.ZERO, "should set sfixed64 values from Longs as signed");
+            test.equal(protobuf.util.Long.ZERO.unsigned, false, "should not mutate Long.ZERO");
+            test.equal(protobuf.util.Long.UZERO.unsigned, true, "should not mutate Long.UZERO");
+            test.equal(obj.fixed64Val, 11000000000000000001n, "should output fixed64 as unsigned bigint");
+            test.equal(obj.sfixed64Val, -9000000000000000001n, "should output sfixed64 as signed bigint");
+            test.same(defaults.fixed64Val, { low: 0, high: 0, unsigned: true }, "should default fixed64 as unsigned");
+            test.same(defaults.sfixed64Val, { low: 0, high: 0, unsigned: false }, "should default sfixed64 as signed");
+
+            test.end();
+        });
+
+        test.test(test.name + " - Type.toObject recursion limit", function(test) {
+            var recursionLimit = protobuf.util.recursionLimit;
+            protobuf.util.recursionLimit = 3;
+            try {
+                var nestedRoot = protobuf.Root.fromJSON({
+                    nested: {
+                        Recursive: {
+                            fields: {
+                                next: {
+                                    type: "Recursive",
+                                    id: 1
+                                }
+                            }
+                        }
+                    }
+                });
+                var Recursive = nestedRoot.lookupType("Recursive");
+                var msg = Recursive.create();
+                var cursor = msg;
+                for (var i = 0; i < 5; ++i)
+                    cursor = cursor.next = Recursive.create();
+
+                test.throws(function() {
+                    Recursive.toObject(msg);
+                }, /max depth exceeded/, "should reject excessive object conversion depth");
+            } finally {
+                protobuf.util.recursionLimit = recursionLimit;
+            }
 
             test.end();
         });
@@ -196,4 +396,23 @@ tape.test("converters", function(test) {
         test.end();
     });
 
+});
+
+tape.test("converters - bytes field default with bytes = String", function(test) {
+    var proto = "syntax = \"proto2\";\
+    message DefaultBytes {\
+        optional bytes bytes_field = 1 [default = \"moo\"];\
+    }";
+    var Message = protobuf.parse(proto).root.lookupType("DefaultBytes");
+
+    var withDefault = Message.toObject(Message.create({}), { defaults: true, bytes: String });
+    var withValue = Message.toObject(Message.create({ bytesField: protobuf.util.newBuffer([109, 111, 111]) }), { defaults: true, bytes: String });
+
+    test.equal(withDefault.bytesField, "bW9v", "should base64 encode the default value");
+    test.equal(withDefault.bytesField, withValue.bytesField, "should match an explicitly set value");
+
+    var back = Message.fromObject(withDefault);
+    test.same(Array.prototype.slice.call(back.bytesField), [109, 111, 111], "should round-trip through fromObject");
+
+    test.end();
 });

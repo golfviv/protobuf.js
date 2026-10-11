@@ -2,13 +2,219 @@
 var path     = require("path"),
     fs       = require("fs"),
     minimist = require("minimist"),
-    chalk    = require("chalk"),
     pkg      = require("./package.json"),
     util     = require("./util"),
     glob     = require("glob"),
     protobuf = require("protobufjs");
 
 var targets  = util.requireAll("./targets");
+var color    = util.color;
+
+var lintDefault = "eslint-disable " + [
+    "block-scoped-var",
+    "id-length",
+    "no-control-regex",
+    "no-magic-numbers",
+    "no-mixed-operators",
+    "no-prototype-builtins",
+    "no-redeclare",
+    "no-shadow",
+    "no-var",
+    "sort-vars",
+    "default-case",
+    "jsdoc/require-param"
+].join(", ");
+
+var defaults = {
+    "target": "json",
+    "create": true,
+    "encode": true,
+    "decode": true,
+    "verify": true,
+    "convert": true,
+    "delimited": true,
+    "typeurl": true,
+    "beautify": true,
+    "comments": true,
+    "service": true,
+    "dts": false,
+    "es6": null,
+    "lint": lintDefault,
+    "keep-case": false,
+    "alt-comment": false,
+    "force-long": false,
+    "force-number": false,
+    "force-enum-string": false,
+    "force-message": false,
+    "null-defaults": false,
+    "null-semantics": false
+};
+
+var opts = {
+    alias: {
+        target: "t",
+        out: "o",
+        path: "p",
+        wrap: "w",
+        root: "r",
+        dts: "d",
+        lint: "l",
+        // backward compatibility:
+        "force-long": "strict-long",
+        "force-message": "strict-message"
+    },
+    string: [ "target", "out", "path", "wrap", "dependency", "root", "lint", "filter" ],
+    boolean: [ "create", "encode", "decode", "verify", "convert", "delimited", "typeurl", "beautify", "comments", "service", "es6", "dts", "sparse", "keep-case", "alt-comment", "force-long", "force-number", "force-enum-string", "force-message", "null-defaults", "null-semantics"],
+    default: defaults
+};
+
+function normalizeOptions(options) {
+    options = protobuf.util.merge({}, options || {});
+    protobuf.util.merge(options, defaults, true);
+
+    Object.keys(options).forEach(function(key) {
+        var camelKey = key.replace(/-([a-z])/g, function($0, $1) {
+            return $1.toUpperCase();
+        });
+        if (camelKey !== key)
+            options[camelKey] = options[key];
+    });
+
+    if (util.isEsmWrapper(options.wrap))
+        options.es6 = true;
+
+    return options;
+}
+
+function getTarget(name) {
+    return Object.prototype.hasOwnProperty.call(targets, name) ? targets[name] : null;
+}
+
+/**
+ * Generates JavaScript and optional TypeScript declarations from a root.
+ * @param {Root} root Reflected root
+ * @param {Object} options pbjs options
+ * @param {function(?Error, string=, string=)} callback Completion callback
+ * @returns {undefined}
+ * @private
+ */
+exports.generate = function generate(root, options, callback) {
+    options = normalizeOptions(options);
+    var target = getTarget(options.target);
+    if (!target) {
+        // Require custom target
+        try {
+            target = require(path.resolve(process.cwd(), options.target));
+        } catch (err) {
+            return callback(err);
+        }
+    }
+
+    target(root, options, function targetCallback(err, output) {
+        if (err)
+            return callback(err);
+        if (options.dts)
+            return generateDts(root, options, output, function(dtsErr, dtsOutput) {
+                if (dtsErr)
+                    return callback(dtsErr);
+                return callback(null, output, dtsOutput);
+            });
+        return callback(null, output);
+    });
+    return undefined;
+};
+
+exports.deriveDtsPath = deriveDtsPath;
+exports.sparsify = sparsify;
+
+function deriveDtsPath(out) {
+    return out.replace(/\.(?:[cm]?js)$/i, "") + ".d.ts";
+}
+
+function generateDts(root, argv, output, done) {
+    function runPbts(jsOutput) {
+        var pbtsArgs = [],
+            target = getTarget(argv.target);
+        if (target && target.getDependency)
+            pbtsArgs.push("--import", "\\$protobuf=" + target.getDependency(argv));
+        if (argv.target === "json-module")
+            pbtsArgs.push("--no-constructor");
+        if (!argv.comments)
+            pbtsArgs.push("--no-comments");
+
+        require("./pbts").process(jsOutput, pbtsArgs, done);
+    }
+
+    if (argv.target === "static-module")
+        return runPbts(output);
+
+    var dtsOptions = protobuf.util.merge({}, argv);
+    // The temporary static module can expose the reflected root as a default export
+    // only for ES module declarations. CommonJS has no equivalent default export here.
+    if (util.isEsmWrapper(argv.wrap))
+        dtsOptions.defaultExport = targets["json-module"].defaultExportDoc;
+    return targets["static-module"](root, dtsOptions, function(err, staticOutput) {
+        if (err)
+            return done(err);
+        return runPbts(staticOutput);
+    });
+}
+
+function markReferenced(tobj) {
+    tobj.referenced = true;
+    // also mark a type's fields and oneofs
+    if (tobj.fieldsArray)
+        tobj.fieldsArray.forEach(function(fobj) {
+            fobj.referenced = true;
+        });
+    if (tobj.oneofsArray)
+        tobj.oneofsArray.forEach(function(oobj) {
+            oobj.referenced = true;
+        });
+    // also mark an extension field's extended type, but not its (other) fields
+    if (tobj.extensionField)
+        tobj.extensionField.parent.referenced = true;
+}
+
+function sparsify(root, mainFiles) {
+
+    // 1. mark directly or indirectly referenced objects
+    util.traverse(root, function(obj) {
+        if (!obj.filename)
+            return;
+        if (mainFiles.indexOf(obj.filename) > -1)
+            util.traverseResolved(obj, markReferenced);
+    });
+
+    // 2. empty unreferenced objects
+    util.traverse(root, function(obj) {
+        var parent = obj.parent;
+        if (!parent || obj.referenced || obj.declaringField) // root, referenced or synthetic extension field
+            return;
+        // remove unreferenced namespaces
+        if (obj instanceof protobuf.Namespace) {
+            var hasReferenced = false;
+            util.traverse(obj, function(iobj) {
+                if (iobj.referenced)
+                    hasReferenced = true;
+            });
+            if (hasReferenced) { // replace with plain namespace if a namespace subclass
+                if (obj instanceof protobuf.Type || obj instanceof protobuf.Service) {
+                    var robj = new protobuf.Namespace(obj.name, obj.options);
+                    robj.nested = obj.nested;
+                    parent.add(robj);
+                }
+            } else // remove completely if nothing inside is referenced
+                parent.remove(obj);
+
+        // remove everything else unreferenced
+        } else if (!(obj instanceof protobuf.Namespace))
+            parent.remove(obj);
+    });
+
+    // 3. validate that everything is fine
+    root.resolveAll();
+}
 
 /**
  * Runs pbjs programmatically.
@@ -17,67 +223,16 @@ var targets  = util.requireAll("./targets");
  * @returns {number|undefined} Exit code, if known
  */
 exports.main = function main(args, callback) {
-    var lintDefault = "eslint-disable " + [
-        "block-scoped-var",
-        "id-length",
-        "no-control-regex",
-        "no-magic-numbers",
-        "no-prototype-builtins",
-        "no-redeclare",
-        "no-shadow",
-        "no-var",
-        "sort-vars"
-    ].join(", ");
-    var argv = minimist(args, {
-        alias: {
-            target: "t",
-            out: "o",
-            path: "p",
-            wrap: "w",
-            root: "r",
-            lint: "l",
-            // backward compatibility:
-            "force-long": "strict-long",
-            "force-message": "strict-message"
-        },
-        string: [ "target", "out", "path", "wrap", "dependency", "root", "lint" ],
-        boolean: [ "create", "encode", "decode", "verify", "convert", "delimited", "typeurl", "beautify", "comments", "service", "es6", "sparse", "keep-case", "force-long", "force-number", "force-enum-string", "force-message", "null-defaults" ],
-        default: {
-            target: "json",
-            create: true,
-            encode: true,
-            decode: true,
-            verify: true,
-            convert: true,
-            delimited: true,
-            typeurl: true,
-            beautify: true,
-            comments: true,
-            service: true,
-            es6: null,
-            lint: lintDefault,
-            "keep-case": false,
-            "force-long": false,
-            "force-number": false,
-            "force-enum-string": false,
-            "force-message": false,
-            "null-defaults": false,
-        }
-    });
+    var argv = normalizeOptions(minimist(args, opts));
 
-    var target = targets[argv.target],
-        files  = argv._,
+    var files  = argv._,
         paths  = typeof argv.path === "string" ? [ argv.path ] : argv.path || [];
 
-    // alias hyphen args in camel case
-    Object.keys(argv).forEach(function(key) {
-        var camelKey = key.replace(/-([a-z])/g, function($0, $1) { return $1.toUpperCase(); });
-        if (camelKey !== key)
-            argv[camelKey] = argv[key];
-    });
+    if (!paths.length)
+        paths.push(".");
 
     // protobuf.js package directory contains additional, otherwise non-bundled google types
-    paths.push(path.relative(process.cwd(), path.join(__dirname, "..")) || ".");
+    paths.push(path.relative(process.cwd(), path.join(__dirname, "../protobufjs")) || ".");
 
     if (!files.length) {
         var descs = Object.keys(targets).filter(function(key) { return !targets[key].private; }).map(function(key) {
@@ -89,7 +244,7 @@ exports.main = function main(args, callback) {
             process.stderr.write([
                 "protobuf.js v" + pkg.version + " CLI for JavaScript",
                 "",
-                chalk.bold.white("Translates between file formats and generates static code."),
+                color.bold + color.white + "Translates between file formats and generates static code." + color.reset,
                 "",
                 "  -t, --target     Specifies the target format. Also accepts a path to require a custom target.",
                 "",
@@ -97,18 +252,23 @@ exports.main = function main(args, callback) {
                 "",
                 "  -p, --path       Adds a directory to the include path.",
                 "",
+                "  --filter         Path to a JSON file listing messages and their dependencies to keep.",
+                "                   Example: {\"messageNames\":[\"mypackage.Message\",\"Message2\"]}",
+                "",
                 "  -o, --out        Saves to a file instead of writing to stdout.",
+                "",
+                "  -d, --dts        Also saves a .d.ts file next to --out for static-module and json-module.",
                 "",
                 "  --sparse         Exports only those types referenced from a main file (experimental).",
                 "",
-                chalk.bold.gray("  Module targets only:"),
+                color.bold + color.gray + "  Module targets only:" + color.reset,
                 "",
                 "  -w, --wrap       Specifies the wrapper to use. Also accepts a path to require a custom wrapper.",
                 "",
                 "                   default   Default wrapper supporting both CommonJS and AMD",
                 "                   commonjs  CommonJS wrapper",
                 "                   amd       AMD wrapper",
-                "                   es6       ES6 wrapper (implies --es6)",
+                "                   esm       ESM wrapper (implies --es6)",
                 "                   closure   A closure adding to protobuf.roots where protobuf is a global",
                 "",
                 "  --dependency     Specifies which version of protobuf to require. Accepts any valid module id",
@@ -121,11 +281,12 @@ exports.main = function main(args, callback) {
                 "",
                 "  --es6            Enables ES6 syntax (const/let instead of var)",
                 "",
-                chalk.bold.gray("  Proto sources only:"),
+                color.bold + color.gray + "  Proto sources only:" + color.reset,
                 "",
                 "  --keep-case      Keeps field casing instead of converting to camel case.",
+                "  --alt-comment    Turns on an alternate comment parsing mode that preserves more comments.",
                 "",
-                chalk.bold.gray("  Static targets only:"),
+                color.bold + color.gray + "  Static targets only:" + color.reset,
                 "",
                 "  --no-create      Does not generate create functions used for reflection compatibility.",
                 "  --no-encode      Does not generate encode functions.",
@@ -143,8 +304,9 @@ exports.main = function main(args, callback) {
                 "  --force-message  Enforces the use of message instances instead of plain objects.",
                 "",
                 "  --null-defaults  Default value for optional fields is null instead of zero value.",
+                "  --null-semantics Make nullable fields match protobuf semantics (overrides --null-defaults).",
                 "",
-                "usage: " + chalk.bold.green("pbjs") + " [options] file1.proto file2.json ..." + chalk.gray("  (or pipe)  ") + "other | " + chalk.bold.green("pbjs") + " [options] -",
+                "usage: " + color.bold + color.green + "pbjs" + color.reset + " [options] file1.proto file2.json ..." + color.gray + "  (or pipe)  " + color.reset + "other | " + color.bold + color.green + "pbjs" + color.reset + " [options] -",
                 ""
             ].join("\n"));
         return 1;
@@ -162,10 +324,6 @@ exports.main = function main(args, callback) {
         } else
             ++i;
     }
-
-    // Require custom target
-    if (!target)
-        target = require(path.resolve(process.cwd(), argv.target));
 
     var root = new protobuf.Root();
 
@@ -198,13 +356,26 @@ exports.main = function main(args, callback) {
         return resolved;
     };
 
-    // `--wrap es6` implies `--es6` but not the other way around. You can still use e.g. `--es6 --wrap commonjs`
-    if (argv.wrap === "es6") {
-        argv.es6 = true;
+    if (argv.dts) {
+        var dtsError = null;
+        if (!argv.out)
+            dtsError = Error("--dts requires --out");
+        else if (argv.target !== "static-module" && argv.target !== "json-module")
+            dtsError = Error("--dts requires --target static-module or json-module");
+        else if (argv.wrap !== "commonjs" && !util.isEsmWrapper(argv.wrap))
+            dtsError = Error("--dts requires --wrap commonjs or esm");
+        if (dtsError) {
+            if (callback) {
+                callback(dtsError);
+                return undefined;
+            }
+            throw dtsError;
+        }
     }
 
     var parseOptions = {
-        "keepCase": argv["keep-case"] || false
+        "keepCase": argv["keep-case"] || false,
+        "alternateCommentMode": argv["alt-comment"] || false,
     };
 
     // Read from stdin
@@ -238,7 +409,7 @@ exports.main = function main(args, callback) {
         try {
             root.loadSync(files, parseOptions).resolveAll(); // sync is deterministic while async is not
             if (argv.sparse)
-                sparsify(root);
+                sparsify(root, mainFiles);
             callTarget();
         } catch (err) {
             if (callback) {
@@ -249,83 +420,46 @@ exports.main = function main(args, callback) {
         }
     }
 
-    function markReferenced(tobj) {
-        tobj.referenced = true;
-        // also mark a type's fields and oneofs
-        if (tobj.fieldsArray)
-            tobj.fieldsArray.forEach(function(fobj) {
-                fobj.referenced = true;
-            });
-        if (tobj.oneofsArray)
-            tobj.oneofsArray.forEach(function(oobj) {
-                oobj.referenced = true;
-            });
-        // also mark an extension field's extended type, but not its (other) fields
-        if (tobj.extensionField)
-            tobj.extensionField.parent.referenced = true;
-    }
-
-    function sparsify(root) {
-
-        // 1. mark directly or indirectly referenced objects
-        util.traverse(root, function(obj) {
-            if (!obj.filename)
-                return;
-            if (mainFiles.indexOf(obj.filename) > -1)
-                util.traverseResolved(obj, markReferenced);
-        });
-
-        // 2. empty unreferenced objects
-        util.traverse(root, function(obj) {
-            var parent = obj.parent;
-            if (!parent || obj.referenced) // root or referenced
-                return;
-            // remove unreferenced namespaces
-            if (obj instanceof protobuf.Namespace) {
-                var hasReferenced = false;
-                util.traverse(obj, function(iobj) {
-                    if (iobj.referenced)
-                        hasReferenced = true;
-                });
-                if (hasReferenced) { // replace with plain namespace if a namespace subclass
-                    if (obj instanceof protobuf.Type || obj instanceof protobuf.Service) {
-                        var robj = new protobuf.Namespace(obj.name, obj.options);
-                        robj.nested = obj.nested;
-                        parent.add(robj);
-                    }
-                } else // remove completely if nothing inside is referenced
-                    parent.remove(obj);
-
-            // remove everything else unreferenced
-            } else if (!(obj instanceof protobuf.Namespace))
-                parent.remove(obj);
-        });
-
-        // 3. validate that everything is fine
-        root.resolveAll();
+    function filterMessage() {
+        if (argv.filter) {
+            // This is a piece of degradable logic
+            try {
+                const needMessage = JSON.parse(fs.readFileSync(argv.filter));
+                util.filterMessage(root, needMessage);
+            } catch (error) {
+                process.stderr.write(`The filter not work, please check whether the file is correct: ${error.message}\n`);
+            }
+        }
     }
 
     function callTarget() {
-        target(root, argv, function targetCallback(err, output) {
+        filterMessage();
+        exports.generate(root, argv, function targetCallback(err, output, dtsOutput) {
             if (err) {
                 if (callback)
                     return callback(err);
                 throw err;
             }
-            try {
-                if (argv.out)
-                    fs.writeFileSync(argv.out, output, { encoding: "utf8" });
-                else if (!callback)
-                    process.stdout.write(output, "utf8");
-                return callback
-                    ? callback(null, output)
-                    : undefined;
-            } catch (err) {
-                if (callback)
-                    return callback(err);
-                throw err;
-            }
+            return writeOutputs(output, dtsOutput);
         });
+    }
+
+    function writeOutputs(output, dtsOutput) {
+        try {
+            if (argv.out) {
+                fs.writeFileSync(argv.out, output, { encoding: "utf8" });
+                if (dtsOutput)
+                    fs.writeFileSync(deriveDtsPath(argv.out), dtsOutput, { encoding: "utf8" });
+            } else if (!callback)
+                process.stdout.write(output, "utf8");
+            return callback
+                ? callback(null, output)
+                : undefined;
+        } catch (err) {
+            if (callback)
+                return callback(err);
+            throw err;
+        }
     }
 
     return undefined;

@@ -16,10 +16,20 @@ var protoRepeated = "message Test {\
     };\
 }";
 
-tape.test("legacy groups", function(test) {
-    var root = protobuf.parse(protoRequired).root;
+var protoExtension = "syntax = \"proto2\";\
+message Message {\
+    extensions 100 to max;\
+}\
+extend Message {\
+    optional group GroupField = 100 {\
+        optional uint32 a = 101;\
+    }\
+}";
 
-    var Test = root.resolveAll().lookup("Test");
+tape.test("legacy groups", function(test) {
+    var root = protobuf.parse(protoRequired).root.resolveAll();
+
+    var Test = root.lookup("Test");
     var MyGroupType = Test.get("MyGroup");
     var MyGroupField = Test.get("myGroup");
     var msg = {
@@ -30,6 +40,7 @@ tape.test("legacy groups", function(test) {
     
     test.ok(MyGroupType instanceof protobuf.Type && MyGroupField instanceof protobuf.Field, "should parse to a type and a field");
     test.equal(MyGroupType.group, true, "should have the group flag set on the type");
+    test.equal(MyGroupField.delimited, true, "should have the delimited flag set on the field");
     test.equal(MyGroupField.resolvedType, MyGroupType, "should reference the type from the field");
     var json = MyGroupType.toJSON();
     test.equal(json.group, true, "should export group=true to JSON");
@@ -37,6 +48,13 @@ tape.test("legacy groups", function(test) {
     test.equal(MyGroupType2.group, true, "should import group=true from JSON");
     // NOTE: fromJSON alone does not add the sister-field.
     // The parser does this explicitly and the field is part of the exported JSON itself.
+
+    test.test(test.name + " - should decode without prior setup", (function(Test, msg) { return function(test) {
+        // Use a fixed buffer so encode() does not set up the nested group decoder first
+        var buf = protobuf.util.newBuffer([1 << 3 | 3, 2 << 3 | 0, 111, 1 << 3 | 4]);
+        test.same(Test.decode(buf), msg, "and decode back the original message");
+        test.end();
+    };})(Test, msg));
 
     test.test(test.name + " - should encode required", (function(Test, msg) { return function(test) {
         var buf = Test.encode(msg).finish();
@@ -48,6 +66,14 @@ tape.test("legacy groups", function(test) {
         test.same(Test.decode(buf), msg, "and decode back the original message");
         test.end();
     };})(Test, msg));
+
+    test.test(test.name + " - should reject unmatched start group", (function(Test) { return function(test) {
+        var buf = protobuf.util.newBuffer([1 << 3 | 3]);
+        test.throws(function() {
+            Test.decode(buf);
+        }, /missing end group/, "should reject groups without an end tag");
+        test.end();
+    };})(Test));
 
     // Same but repeated
     root = protobuf.parse(protoRepeated).root;
@@ -75,5 +101,120 @@ tape.test("legacy groups", function(test) {
         test.end();
     };})(Test, msg));
 
+    test.end();
+});
+
+
+tape.test("delimited encoding", function(test) {
+    var root = protobuf.parse(`
+        edition = "2023";
+        message Message {
+            uint32 a = 2;
+        };
+        message Test {
+            Message msg = 1 [features.message_encoding = DELIMITED];
+        }
+    `).root.resolveAll();
+
+    var Test = root.lookup("Test");
+    var Message = root.get("Message");
+    var Field = Test.get("msg");
+    var msg = {
+        msg: {
+            a: 111
+        }
+    };
+
+    test.ok(Message instanceof protobuf.Type && Field instanceof protobuf.Field, "should parse to a type and a field");
+    test.notOk(Message.group, "should not have the group flag set on the type");
+    test.ok(Field.delimited, "should have the delimited flag set on the field");
+    test.equal(Field.resolvedType, Message, "should reference the type from the field");
+
+    test.test(test.name + " - should encode required", (function(Test, msg) { return function(test) {
+        var buf = Test.encode(msg).finish();
+        test.equal(buf.length, 4, "a total of 4 bytes");
+        test.equal(buf[0], 1 << 3 | 3, "id 1, wireType 3");
+        test.equal(buf[1], 2 << 3 | 0, "id 2, wireType 0");
+        test.equal(buf[2], 111, "111");
+        test.equal(buf[3], 1 << 3 | 4, "id 1, wireType 4");
+        test.same(Test.decode(buf), msg, "and decode back the original message");
+        test.end();
+    };})(Test, msg));
+
+    // Same but repeated
+    root = protobuf.parse(`
+        edition = "2023";
+        message Message {
+            uint32 a = 2;
+        };
+        message Test {
+            repeated Message msg = 1 [features.message_encoding = DELIMITED];
+        }
+    `).root;
+    Test = root.resolveAll().lookup("Test");
+    msg = {
+        msg: [{
+            a: 111
+        },{
+            a: 112
+        }]
+    };
+
+    test.test(test.name + " - should encode repeated", (function(Test, msg) { return function(test) {
+        var buf = Test.encode(msg).finish();
+        test.equal(buf.length, 8, "a total of 8 bytes");
+        test.equal(buf[0], 1 << 3 | 3, "id 1, wireType 3");
+        test.equal(buf[1], 2 << 3 | 0, "id 2, wireType 0");
+        test.equal(buf[2], 111, "111");
+        test.equal(buf[3], 1 << 3 | 4, "id 1, wireType 4");
+        test.equal(buf[4], 1 << 3 | 3, "id 1, wireType 3");
+        test.equal(buf[5], 2 << 3 | 0, "id 2, wireType 0");
+        test.equal(buf[6], 112, "112");
+        test.equal(buf[7], 1 << 3 | 4, "id 1, wireType 4");
+        test.same(Test.decode(buf), msg, "and decode back the original message");
+        test.end();
+    };})(Test, msg));
+
+    test.end();
+});
+
+tape.test("extension groups", function(test) {
+    var root = protobuf.parse(protoExtension).root.resolveAll();
+
+    var Message = root.lookupType("Message");
+    var GroupField = root.get("groupField");
+    var ExtensionField = Message.get(GroupField.fullName);
+    var msg = {};
+    msg[GroupField.fullName] = {
+        a: 111
+    };
+
+    test.equal(ExtensionField.declaringField, GroupField, "should add the sister field to the extended type");
+    test.equal(ExtensionField.delimited, true, "should use delimited encoding on the sister field");
+
+    var buf = Message.encode(msg).finish();
+    test.same(Array.prototype.slice.call(buf), [ 163, 6, 168, 6, 111, 164, 6 ], "should encode as a group");
+    test.same(Message.decode(buf), msg, "and decode back the original message");
+    test.end();
+});
+
+var protoGroupWithMap = "message Test {\
+    optional group MyGroup = 1 {\
+        optional int32 a = 2;\
+        map<string, int32> mp = 8;\
+    };\
+}";
+
+tape.test("group with map field", function(test) {
+    var root = protobuf.parse(protoGroupWithMap).root.resolveAll();
+
+    var MyGroupType = root.lookup("Test.MyGroup");
+    var mapField = MyGroupType.get("mp");
+
+    test.equal(MyGroupType.group, true, "should have the group flag set on the type");
+    test.ok(mapField instanceof protobuf.MapField, "should parse the nested map field to a MapField");
+    test.equal(mapField.map, true, "should have the map flag set on the field");
+    test.equal(mapField.keyType, "string", "should keep the map key type");
+    test.equal(mapField.type, "int32", "should keep the map value type");
     test.end();
 });

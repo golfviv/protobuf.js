@@ -5,6 +5,36 @@ var protobuf = require("..");
 var Writer = protobuf.Writer,
     Reader = protobuf.Reader;
 
+tape.test("reader length prefixes", function(test) {
+    [ 0, 127, 128, 16384, 2097152, 268435456, 2147483647 ].forEach(function(value) {
+        test.equal(Reader.create(Writer.create().uint32(value).finish()).size(), value, "accepts length " + value);
+    });
+    test.equal(Reader.create([ 128, 128, 128, 128, 0 ]).size(), 0, "accepts a non-minimal length within five bytes");
+
+    [
+        [ 128, 128, 128, 128, 8 ],
+        [ 128, 128, 128, 128, 16 ],
+        [ 128, 128, 128, 128, 128, 0 ]
+    ].forEach(function(bytes) {
+        test.throws(function() {
+            Reader.create(bytes).size();
+        }, /invalid length encoding/, "rejects an overflowing or overlong length");
+    });
+    test.equal(Reader.create([ 128, 128, 128, 128, 16 ]).uint32(), 0, "retains scalar uint32 truncation");
+    test.throws(function() {
+        Reader.create([ 128, 128, 128, 128 ]).size();
+    }, RangeError, "rejects a truncated length");
+
+    [ Uint8Array, protobuf.util.Buffer ].filter(Boolean).forEach(function(BufferType) {
+        [ "bytes", "string", "stringVerify" ].forEach(function(method) {
+            test.throws(function() {
+                Reader.create(BufferType.from([ 128, 128, 128, 128, 16 ]))[method]();
+            }, /invalid length encoding/, BufferType.name + "." + method + " rejects an overflowing length");
+        });
+    });
+    test.end();
+});
+
 tape.test("writer & reader", function(test) {
 
     test.throws(function() {
@@ -38,7 +68,12 @@ tape.test("writer & reader", function(test) {
 
     test.ok(expect("uint32", -1 >>> 0, [ 255, 255, 255, 255, 15 ]), "should write -1 as an unsigned varint of length 5");
     test.ok(expect("int32", -1, [ 255, 255, 255, 255, 255, 255, 255, 255, 255, 1 ]), "should write -1 as a signed varint of length 10");
+    test.ok(expectCoerced("int32", -0.1, [ 0 ], 0), "should coerce fractional signed varints before sizing");
+    test.ok(expectCoerced("int32", 2147483648, [ 128, 128, 128, 128, 248, 255, 255, 255, 255, 1 ], -2147483648), "should coerce out-of-range signed varints before sizing");
     test.ok(expect("sint32", -1, [ 1 ]), "should write -1 as a signed zig-zag encoded varint of length 1");
+    var reader = Reader.create([ 128, 128, 128, 128, 128, 0, 1 ]);
+    test.equal(reader.uint32(), 0, "should read non-minimal uint32 varints");
+    test.equal(reader.uint32(), 1, "should stop after the non-minimal uint32 varint");
 
     // fixed32, sfixed32
 
@@ -79,6 +114,12 @@ tape.test("writer & reader", function(test) {
         var zzBaseVal = longVal.shru(1).xor(longVal.and(1).negate());
         test.ok(expect("sint64", zzBaseVal, val[1]), "should write " + zzBaseVal + " as a signed zig-zag encoded varint of length " + val[1].length + " and read it back equally");
     });
+    test.throws(function() {
+        Reader.create([ 128, 128, 128 ]).uint64();
+    }, /index out of range/, "should throw on truncated 64 bit varints with 3 bytes");
+    test.throws(function() {
+        Reader.create([ 128, 128, 128, 128 ]).uint64();
+    }, /index out of range/, "should throw on truncated 64 bit varints with 4 bytes");
 
     // fixed64, sfixed64 -> see also see comp_fixed/sfixed64 (grpc)
 
@@ -90,17 +131,32 @@ tape.test("writer & reader", function(test) {
 
     test.ok(expect("bool", true, [1]), "should write true as a varint of length 1 and read it back equally");
     test.ok(expect("bool", false, [0]), "should write false as a varint of length 1 and read it back equally");
+    test.equal(Reader.create([ 128, 128, 128, 128, 16 ]).bool(), true, "should read 64 bit non-zero bool varints as true");
 
-    // string, see also lib_utf8
+    // string, see also util_utf8
 
     test.ok(expect("string", "123", [3,49,50,51]), "should write \"123\" as a string prefixed with its length as a varint and read it back equally");
+    test.ok(expect("string", "hello world", [11,104,101,108,108,111,32,119,111,114,108,100], Writer), "should write ascii strings with the array writer");
+    test.ok(expect("string", "ä", [2,195,164], Writer), "should write non-ascii strings with the array writer");
     test.ok(expect("string", "", [0]), "should write \"\" as a string prefixed with its length as a varint and read it back equally");
+    test.throws(function() {
+        Reader.create(protobuf.util.newBuffer([ 3, 49, 50 ])).string();
+    }, /index out of range/, "should throw on truncated strings");
 
     // bytes
 
     test.ok(expect("bytes", [1,2,3], [3,1,2,3]), "should write [1,2,3] as bytes prefixed with its length as a varint and read it back equally");
     test.ok(expect("bytes", [], [0]), "should write [] as bytes prefixed with its length as a varint and read it back equally");
     test.ok(expect("bytes", "MTIz", [3,49,50,51]), "should write MTIz as bytes prefixed with its length as a varint and read it back equally");
+
+    // raw bytes
+
+    var rawReader = Reader.create([0,1,2,3]);
+    test.deepEqual(Array.prototype.slice.call(rawReader.raw(1, 3)), [1,2], "should read raw bytes without a length prefix");
+    test.equal(rawReader.pos, 0, "should read raw bytes without advancing");
+    if (protobuf.util.Buffer)
+        test.deepEqual(Reader.create(protobuf.util.Buffer.from([0,1,2,3])).raw(1, 3), protobuf.util.Buffer.from([1,2]), "should preserve buffer backed raw bytes");
+    test.deepEqual(Array.prototype.slice.call(Writer.create().raw([1,2,3]).finish()), [1,2,3], "should write raw bytes without a length prefix");
 
     // skipType
 
@@ -109,8 +165,8 @@ tape.test("writer & reader", function(test) {
             .uint32(1)
             .double(0.1)
             .string("123")
-            .uint32(1 << 3 | 1).double(0.1).uint32(4)
-            .uint32(4)
+            .uint32(1 << 3 | 1).double(0.1).uint32(1 << 3 | 4)
+            .uint32(1 << 3 | 4)
             .float(0.125)
             .finish()
         );
@@ -128,6 +184,80 @@ tape.test("writer & reader", function(test) {
         test.equal(reader.pos, 28, "fixed 32 bits");
         test.end();
     });
+
+    test.test(test.name + " - finishInto", function(test) {
+
+        // writes at offset and preserves existing data
+        var w2 = Writer.create();
+        w2.uint32(100).string("hello").bool(true);
+        var expected = w2.finish();
+
+        var w3 = Writer.create();
+        w3.uint32(100).string("hello").bool(true);
+        var offset = 3;
+        var buf3 = new Uint8Array(offset + w3.pos);
+        for (var i = 0; i < offset; ++i)
+            buf3[i] = 99;
+        w3.finishInto(buf3, offset);
+
+        for (var i = 0; i < offset; ++i)
+            test.equal(buf3[i], 99, "preserves byte at index " + i + " before offset");
+        for (var i = 0; i < expected.length; ++i)
+            test.equal(buf3[offset + i], expected[i], "byte at offset+" + i + " matches finish()");
+
+        test.end();
+    });
+
+    test.test(test.name + " - finish size", function(test) {
+        var buf = Writer.create().uint32(1).finish();
+
+        test.equal(buf.length, 1, "should expose only written bytes");
+        test.equal(buf.byteLength, 1, "should have the written byte length");
+        test.same(Array.prototype.slice.call(buf), [ 1 ], "should contain written bytes");
+        test.end();
+    });
+
+    test.test(test.name + " - shared finish view", function(test) {
+        var writer = Writer.create().uint32(1);
+        var shared = writer.finish(true);
+
+        test.equal(shared.length, 1, "should expose only written bytes");
+        test.same(Array.prototype.slice.call(shared), [ 1 ], "should contain written bytes");
+
+        shared[0] = 2;
+        test.equal(writer.buf[0], 2, "should share the writer's backing buffer");
+
+        var copied = writer.finish();
+        copied[0] = 3;
+        test.equal(writer.buf[0], 2, "default finish should return an independent buffer");
+        test.end();
+    });
+
+    test.test(test.name + " - repeated finish", function(test) {
+
+        [ "int32", "uint64", "int64", "sint64" ].forEach(function(type) {
+            var writer = Writer.create()[type](-1);
+            test.same(Array.prototype.slice.call(writer.finish()), Array.prototype.slice.call(writer.finish()), "should preserve " + type + " operation state");
+        });
+
+        test.end();
+    });
+
+    test.throws(function() {
+      const root = protobuf.Root.fromJSON({
+        nested: {
+          MyMessage: {
+            fields: {
+              name: { type: "string", id: 1 }
+            }
+          }
+        }
+      });
+      const MyMessage = root.lookupType("MyMessage");
+      // 0x7B (field 15, wire type 3 = start group)
+      const payload = Buffer.alloc(50000, 0x7B);
+      MyMessage.decode(payload);
+    }, /max depth exceeded/, "limits recursion in reader");
 
     test.end();
 });
@@ -173,6 +303,35 @@ function expect(type, value, expected, WriterToTest) {
     // also test browser writer if running under node
     if (WriterToTest !== protobuf.Writer) {
         if (!expect(type, value, expected, Writer)) {
+            console.error("in browser writer");
+            return false;
+        }
+    }
+    return true;
+}
+
+function expectCoerced(type, value, expected, expectedValue, WriterToTest) {
+    if (!WriterToTest)
+        WriterToTest = Writer.create().constructor;
+    var writer = new WriterToTest();
+    var actual = writer[type](value).finish();
+    if (actual.length !== expected.length) {
+        console.error("actual", Array.prototype.slice.call(actual), "!= expected", expected);
+        return false;
+    }
+    for (var i = 0; i < expected.length; ++i)
+        if (actual[i] !== expected[i]) {
+            console.error("actual", Array.prototype.slice.call(actual), "!= expected", expected);
+            return false;
+        }
+    var reader = Reader.create(actual);
+    var actualValue = reader[type]();
+    if (actualValue !== expectedValue) {
+        console.error("actual value", actualValue, "!= expected", expectedValue);
+        return false;
+    }
+    if (WriterToTest !== protobuf.Writer) {
+        if (!expectCoerced(type, value, expected, expectedValue, Writer)) {
             console.error("in browser writer");
             return false;
         }
